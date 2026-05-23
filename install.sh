@@ -60,8 +60,9 @@ if [ -n "$SELF_DIR" ] && [ -f "$SELF_DIR/pysmith.py" ]; then
   say "installing from local checkout: $SELF_DIR"
   mkdir -p "$SRC_DIR"
   cp -f "$SELF_DIR/pysmith.py" "$SRC_DIR/"
-  mkdir -p "$SRC_DIR/assets"
+  mkdir -p "$SRC_DIR/assets" "$SRC_DIR/ui"
   [ -d "$SELF_DIR/assets" ] && cp -f "$SELF_DIR/assets/"* "$SRC_DIR/assets/" 2>/dev/null || true
+  [ -d "$SELF_DIR/ui" ] && cp -f "$SELF_DIR/ui/"* "$SRC_DIR/ui/" 2>/dev/null || true
   ok "copied source"
 else
   say "fetching pysmith"
@@ -113,11 +114,7 @@ for sz in 256 128; do
   fi
 done
 
-# pick a terminal to launch the TUI in, for the menu entry
-TERM_EXEC=""
-for t in x-terminal-emulator gnome-terminal konsole kgx tilix xfce4-terminal alacritty kitty; do
-  if command -v "$t" >/dev/null 2>&1; then TERM_EXEC="$t"; break; fi
-done
+# pysmith opens its own browser window, so the menu entry just launches it
 mkdir -p "$APP_DIR"
 {
   echo "[Desktop Entry]"
@@ -127,17 +124,8 @@ mkdir -p "$APP_DIR"
   echo "Icon=pysmith"
   echo "Categories=Development;Utility;"
   echo "Keywords=python;ai;tools;groq;forge;"
-  if [ -n "$TERM_EXEC" ]; then
-    case "$TERM_EXEC" in
-      gnome-terminal|kgx|tilix) echo "Exec=$TERM_EXEC -- $LAUNCHER" ;;
-      konsole|kitty|alacritty)  echo "Exec=$TERM_EXEC -e $LAUNCHER" ;;
-      *)                        echo "Exec=$TERM_EXEC -e $LAUNCHER" ;;
-    esac
-    echo "Terminal=false"
-  else
-    echo "Exec=$LAUNCHER"
-    echo "Terminal=true"
-  fi
+  echo "Exec=$LAUNCHER"
+  echo "Terminal=false"
 } > "$APP_DIR/pysmith.desktop"
 chmod +x "$APP_DIR/pysmith.desktop"
 command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$APP_DIR" 2>/dev/null || true

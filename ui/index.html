@@ -1,0 +1,524 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pysmith</title>
+<link rel="icon" href="/assets/icon.svg">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<style>
+  :root{
+    --bg:#0c0e0f; --bg2:#101315; --panel:#15191b; --panel2:#1a1f22;
+    --line:#262d31; --line2:#1d2225;
+    --ink:#e7eaeb; --dim:#8a9398; --faint:#596268; --steel:#c7ced2;
+    --amber:#e8a33d; --ember:#e07a3a; --lime:#9fe04a; --cyan:#46c7d4; --red:#e0594a;
+    --mono:"JetBrains Mono",ui-monospace,monospace;
+    --ui:"Sora",system-ui,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{
+    font-family:var(--ui);font-size:14px;color:var(--ink);overflow:hidden;
+    background:
+      radial-gradient(900px 420px at 72% 118%, rgba(224,122,58,.10), transparent 60%),
+      radial-gradient(700px 360px at 50% -10%, rgba(70,90,100,.08), transparent 60%),
+      var(--bg);
+  }
+  body::before{content:"";position:fixed;inset:0;pointer-events:none;opacity:.5;
+    background-image:linear-gradient(rgba(255,255,255,.014) 1px,transparent 1px),
+      linear-gradient(90deg,rgba(255,255,255,.014) 1px,transparent 1px);
+    background-size:30px 30px;}
+  .app{display:grid;grid-template-rows:54px 1fr;height:100vh}
+
+  /* ---------- top bar ---------- */
+  .top{display:flex;align-items:center;gap:14px;padding:0 16px;
+    background:linear-gradient(180deg,#171c1f,#11161800);
+    border-bottom:1px solid var(--line);z-index:5}
+  .logo{display:flex;align-items:center;gap:11px}
+  .logo img{width:28px;height:28px;border-radius:7px;
+    box-shadow:0 0 0 1px #0006, 0 4px 14px rgba(224,122,58,.18)}
+  .logo .name{font-weight:700;letter-spacing:.02em;font-size:16px}
+  .logo .name b{color:var(--amber)}
+  .tool-chip{display:flex;align-items:center;gap:9px;padding:5px 11px;border-radius:8px;
+    background:var(--panel);border:1px solid var(--line);font-family:var(--mono);font-size:12px}
+  .tool-chip .fn{color:var(--steel)}
+  .badge{font-family:var(--mono);font-size:9.5px;letter-spacing:.12em;font-weight:700;
+    padding:3px 7px;border-radius:5px;text-transform:uppercase}
+  .badge.testing{background:rgba(232,163,61,.14);color:var(--amber);border:1px solid rgba(232,163,61,.3)}
+  .badge.release{background:rgba(159,224,74,.14);color:var(--lime);border:1px solid rgba(159,224,74,.3)}
+  .spacer{flex:1}
+  .model-pill{font-family:var(--mono);font-size:11px;color:var(--dim);
+    display:flex;align-items:center;gap:7px}
+  .model-pill .dot{width:7px;height:7px;border-radius:50%;background:var(--faint)}
+  .model-pill .dot.on{background:var(--lime);box-shadow:0 0 7px var(--lime)}
+  .icon-btn{background:var(--panel);border:1px solid var(--line);border-radius:8px;color:var(--dim);
+    width:34px;height:34px;cursor:pointer;font-size:15px;transition:.13s;display:grid;place-items:center}
+  .icon-btn:hover{color:var(--ink);border-color:var(--amber)}
+
+  /* ---------- main split ---------- */
+  .main{display:grid;grid-template-columns:392px 1fr;min-height:0}
+
+  /* dialogue column */
+  .dialogue{display:flex;flex-direction:column;min-height:0;
+    background:linear-gradient(180deg,var(--bg2),var(--bg));border-right:1px solid var(--line)}
+  .dlg-h{padding:12px 16px 8px;display:flex;align-items:center;justify-content:space-between}
+  .dlg-h .t{font-family:var(--mono);font-size:10px;letter-spacing:.16em;color:var(--faint);text-transform:uppercase}
+  .dlg-h .new{font-size:11px;color:var(--dim);cursor:pointer}
+  .dlg-h .new:hover{color:var(--amber)}
+  .thread{flex:1;overflow:auto;padding:6px 16px 16px;display:flex;flex-direction:column;gap:14px}
+  .msg{animation:rise .28s ease both}
+  @keyframes rise{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+  .msg .who{font-family:var(--mono);font-size:10px;letter-spacing:.1em;text-transform:uppercase;
+    margin-bottom:5px;display:flex;align-items:center;gap:7px}
+  .msg.you .who{color:var(--cyan)}
+  .msg.smith .who{color:var(--amber)}
+  .msg .who::before{content:"";width:5px;height:5px;border-radius:50%;background:currentColor}
+  .bubble{font-size:13.5px;line-height:1.55;color:var(--ink);white-space:pre-wrap;word-wrap:break-word}
+  .msg.you .bubble{color:var(--steel)}
+  .msg.smith .bubble{background:var(--panel);border:1px solid var(--line2);border-left:2px solid var(--amber);
+    border-radius:8px;padding:10px 12px}
+  .codeflag{margin-top:7px;font-family:var(--mono);font-size:11px;color:var(--lime);
+    display:flex;align-items:center;gap:6px}
+  .codeflag::before{content:"\27a4";color:var(--faint)}
+  .thinking{display:flex;align-items:center;gap:9px;color:var(--dim);font-size:12.5px;font-family:var(--mono)}
+  .sparks{display:inline-flex;gap:3px}
+  .sparks i{width:5px;height:5px;border-radius:50%;background:var(--ember);animation:spark 1s infinite}
+  .sparks i:nth-child(2){animation-delay:.15s}.sparks i:nth-child(3){animation-delay:.3s}
+  @keyframes spark{0%,100%{opacity:.25;transform:translateY(0)}50%{opacity:1;transform:translateY(-3px)}}
+
+  .composer{padding:12px 16px 16px;border-top:1px solid var(--line)}
+  .composer .box{background:var(--panel);border:1px solid var(--line);border-radius:11px;padding:8px;
+    transition:.15s}
+  .composer .box:focus-within{border-color:var(--amber);box-shadow:0 0 0 3px rgba(232,163,61,.08)}
+  .composer textarea{width:100%;border:none;background:none;color:var(--ink);font-family:var(--ui);
+    font-size:13.5px;resize:none;outline:none;line-height:1.5;max-height:140px}
+  .composer textarea::placeholder{color:var(--faint)}
+  .composer .row{display:flex;align-items:center;justify-content:space-between;margin-top:6px}
+  .composer .hint{font-family:var(--mono);font-size:10px;color:var(--faint)}
+  .send{background:var(--amber);color:#1c1407;border:none;border-radius:8px;padding:7px 14px;
+    font-family:var(--ui);font-weight:700;font-size:13px;cursor:pointer;transition:.13s;display:flex;align-items:center;gap:6px}
+  .send:hover{filter:brightness(1.08)}
+  .send:disabled{opacity:.4;cursor:default}
+
+  /* workspace column */
+  .work{display:grid;grid-template-rows:1.6fr 1fr;min-height:0}
+  .codewrap,.testwrap{display:flex;flex-direction:column;min-height:0}
+  .codewrap{border-bottom:1px solid var(--line)}
+  .wh{display:flex;align-items:center;gap:12px;padding:10px 16px;border-bottom:1px solid var(--line2);
+    background:var(--bg2)}
+  .wh .label{font-family:var(--mono);font-size:10px;letter-spacing:.16em;color:var(--faint);text-transform:uppercase}
+  .wh .fname{font-family:var(--mono);font-size:12px;color:var(--steel)}
+  .wh .acts{margin-left:auto;display:flex;gap:8px}
+  .btn{background:var(--panel);border:1px solid var(--line);border-radius:8px;color:var(--ink);
+    font-family:var(--ui);font-weight:600;font-size:12.5px;padding:7px 13px;cursor:pointer;
+    transition:.13s;display:inline-flex;align-items:center;gap:7px}
+  .btn:hover{border-color:var(--amber);color:#fff}
+  .btn:disabled{opacity:.35;cursor:default}
+  .btn.run{background:linear-gradient(180deg,#f0a948,#e07a3a);color:#1c1206;border-color:#e07a3a;
+    box-shadow:0 0 0 1px #0004,0 3px 12px rgba(224,122,58,.25)}
+  .btn.run:hover{filter:brightness(1.07);border-color:#e07a3a;color:#1c1206}
+  .btn.release{background:rgba(159,224,74,.12);border-color:rgba(159,224,74,.35);color:var(--lime)}
+  .btn.ghost{background:transparent;color:var(--dim)}
+
+  .codebody{flex:1;overflow:auto;min-height:0;position:relative}
+  pre.code{margin:0;padding:14px 16px 18px;font-family:var(--mono);font-size:12.5px;line-height:1.62;
+    counter-reset:ln;tab-size:4}
+  pre.code .line{display:block;white-space:pre;padding-left:46px;position:relative;min-height:1.62em}
+  pre.code .line::before{counter-increment:ln;content:counter(ln);position:absolute;left:0;width:34px;
+    text-align:right;color:#3c4449;user-select:none}
+  /* forge syntax palette over highlight.js */
+  .hljs-keyword,.hljs-built_in{color:#e8a33d}
+  .hljs-string,.hljs-meta-string{color:#9fe04a}
+  .hljs-comment{color:#5b6469;font-style:italic}
+  .hljs-number,.hljs-literal{color:#46c7d4}
+  .hljs-title,.hljs-title.function_{color:#d6dcdf}
+  .hljs-title.class_{color:#c79be0}
+  .hljs-params{color:#cdd3d6}
+  .hljs-attr,.hljs-variable{color:#cdd3d6}
+
+  .empty{height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;
+    text-align:center;padding:30px;gap:14px;color:var(--faint)}
+  .empty img{width:64px;height:64px;border-radius:14px;opacity:.9;filter:saturate(1.1)}
+  .empty h2{margin:0;font-size:16px;color:var(--dim);font-weight:600}
+  .empty p{margin:0;max-width:380px;line-height:1.6;font-size:13px}
+  .empty .steps{display:flex;gap:8px;flex-wrap:wrap;justify-content:center;margin-top:4px}
+  .empty .steps span{font-family:var(--mono);font-size:10.5px;color:var(--dim);
+    border:1px solid var(--line);border-radius:20px;padding:4px 11px;background:var(--panel)}
+
+  /* test console */
+  .testtop{display:flex;align-items:center;gap:10px;padding:10px 16px;border-bottom:1px solid var(--line2);
+    background:var(--bg2)}
+  .testtop .args{flex:1;background:var(--bg);border:1px solid var(--line);border-radius:8px;
+    color:var(--ink);font-family:var(--mono);font-size:12px;padding:7px 10px;outline:none}
+  .testtop .args:focus{border-color:var(--amber)}
+  .console{flex:1;overflow:auto;padding:12px 16px;font-family:var(--mono);font-size:12px;line-height:1.6;
+    white-space:pre-wrap;word-break:break-word;color:var(--dim)}
+  .console .ok{color:var(--lime)} .console .bad{color:var(--red)} .console .meta{color:var(--faint)}
+  .console .out{color:var(--steel)}
+  .console .placeholder{color:var(--faint);font-style:italic}
+
+  /* modal */
+  .scrim{position:fixed;inset:0;background:rgba(6,7,8,.72);display:none;align-items:center;justify-content:center;z-index:20;backdrop-filter:blur(3px)}
+  .scrim.on{display:flex}
+  .modal{background:var(--panel);border:1px solid var(--line);border-radius:14px;width:420px;max-width:92vw;padding:20px;
+    box-shadow:0 24px 60px rgba(0,0,0,.5)}
+  .modal h3{margin:0 0 6px;font-size:15px}
+  .modal p{margin:0 0 14px;color:var(--dim);font-size:13px;line-height:1.55}
+  .modal.danger h3{color:var(--red)}
+  .modal label{display:block;font-family:var(--mono);font-size:10px;letter-spacing:.12em;color:var(--faint);text-transform:uppercase;margin-bottom:6px}
+  .modal input{width:100%;background:var(--bg);border:1px solid var(--line);border-radius:8px;color:var(--ink);
+    font-family:var(--mono);font-size:13px;padding:9px 11px;outline:none;margin-bottom:14px}
+  .modal input:focus{border-color:var(--amber)}
+  .modal .acts{display:flex;gap:9px;justify-content:flex-end}
+  .patts{font-family:var(--mono);font-size:12px;color:var(--red);background:rgba(224,89,74,.08);
+    border:1px solid rgba(224,89,74,.25);border-radius:8px;padding:9px 11px;margin-bottom:14px}
+
+  ::-webkit-scrollbar{width:10px;height:10px}
+  ::-webkit-scrollbar-thumb{background:#2a3237;border-radius:5px}
+  ::-webkit-scrollbar-thumb:hover{background:#343d43}
+  ::-webkit-scrollbar-track{background:transparent}
+  .toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:var(--panel);
+    border:1px solid var(--line);border-left:3px solid var(--lime);border-radius:9px;padding:11px 16px;
+    font-size:13px;color:var(--ink);box-shadow:0 12px 30px rgba(0,0,0,.4);opacity:0;pointer-events:none;
+    transition:.25s;z-index:30}
+  .toast.show{opacity:1;transform:translateX(-50%) translateY(-4px)}
+</style>
+</head>
+<body>
+<div class="app">
+
+  <!-- top bar -->
+  <div class="top">
+    <div class="logo">
+      <img src="/assets/icon.svg" alt="">
+      <span class="name"><b>py</b>smith</span>
+    </div>
+    <div class="tool-chip">
+      <span class="fn" id="fileName">untitled.py</span>
+      <span class="badge testing" id="verBadge">testing</span>
+    </div>
+    <div class="spacer"></div>
+    <div class="model-pill"><span class="dot" id="modelDot"></span><span id="modelName">connecting…</span></div>
+    <button class="icon-btn" id="settingsBtn" title="Settings">⚙</button>
+  </div>
+
+  <!-- main -->
+  <div class="main">
+
+    <!-- dialogue -->
+    <div class="dialogue">
+      <div class="dlg-h">
+        <span class="t">build dialogue</span>
+        <span class="new" id="newBtn">＋ new tool</span>
+      </div>
+      <div class="thread" id="thread"></div>
+      <div class="composer">
+        <div class="box">
+          <textarea id="input" rows="1" placeholder="Describe the tool you want to build…  (we'll agree on it first)"></textarea>
+          <div class="row">
+            <span class="hint">enter to send · shift+enter for newline</span>
+            <button class="send" id="sendBtn">forge ▸</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- workspace -->
+    <div class="work">
+      <div class="codewrap">
+        <div class="wh">
+          <span class="label">tool</span>
+          <span class="fname" id="codeFile">no draft yet</span>
+          <div class="acts">
+            <button class="btn ghost" id="copyBtn" disabled>⧉ copy</button>
+            <button class="btn release" id="releaseBtn" disabled>◆ build release version</button>
+            <button class="btn" id="saveBtn" disabled>⤓ save</button>
+          </div>
+        </div>
+        <div class="codebody" id="codeBody">
+          <div class="empty">
+            <img src="/assets/icon.svg" alt="">
+            <h2>Nothing on the anvil yet</h2>
+            <p>Describe a tool on the left. We'll agree on what it should do, I'll forge a <b style="color:var(--amber)">testing version</b> you can run right here, and when it's right I'll package the <b style="color:var(--lime)">release version</b> for GitHub.</p>
+            <div class="steps"><span>1 · agree</span><span>2 · test</span><span>3 · iterate</span><span>4 · release</span></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="testwrap">
+        <div class="testtop">
+          <span class="label">test</span>
+          <input class="args" id="args" placeholder="args (optional)  e.g.  192.168.1.0/24 --fast">
+          <button class="btn run" id="runBtn" disabled>▶ run &amp; test</button>
+        </div>
+        <div class="console" id="console"><span class="placeholder">Run output appears here. Code never runs on its own — you press the button.</span></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- settings modal -->
+<div class="scrim" id="settingsScrim">
+  <div class="modal">
+    <h3>Settings</h3>
+    <p>Your Groq key stays on this machine (in the local pysmith process) and is never sent to the browser or saved to disk.</p>
+    <label>Groq API key</label>
+    <input type="password" id="keyInput" placeholder="gsk_…">
+    <p style="font-size:12px">Model chain is set in <span style="font-family:var(--mono);color:var(--amber)">pysmith.py</span> → <span style="font-family:var(--mono)">MODELS</span>.</p>
+    <div class="acts">
+      <button class="btn ghost" id="settingsCancel">cancel</button>
+      <button class="btn" id="settingsSave">save key</button>
+    </div>
+  </div>
+</div>
+
+<!-- danger modal -->
+<div class="scrim" id="dangerScrim">
+  <div class="modal danger">
+    <h3>⚠ Hold on</h3>
+    <p>This draft matches destructive patterns. Read it before you run it — this will execute on your machine as you.</p>
+    <div class="patts" id="dangerPatts"></div>
+    <div class="acts">
+      <button class="btn ghost" id="dangerCancel">cancel</button>
+      <button class="btn run" id="dangerConfirm">run anyway</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+const SYS_TAG = "system"; // role marker
+
+let state = {
+  messages: [],          // {role, content} (excludes the system prompt, server prepends none — we send full)
+  code: null,
+  name: "tool",
+  version: "testing",
+  busy: false,
+  pendingRelease: false,
+};
+
+// ---------- boot ----------
+init();
+async function init(){
+  try{
+    const s = await fetch("/api/status").then(r=>r.json());
+    $("#modelName").textContent = s.model || "ready";
+    if(s.hasKey){ $("#modelDot").classList.add("on"); }
+    else { openSettings(); }
+  }catch(e){ $("#modelName").textContent = "server offline"; }
+  greet();
+}
+
+function greet(){
+  addMsg("smith", "Right — what do you want to build? Tell me the job in plain English and I'll either ask a couple of sharp questions or lay out a quick plan. Once we agree, I forge a testing version you can run on the spot.");
+}
+
+// ---------- dialogue ----------
+function addMsg(who, text, codeFlag){
+  const t = $("#thread");
+  const m = document.createElement("div");
+  m.className = "msg " + who;
+  m.innerHTML = `<div class="who">${who==="you"?"you":"pysmith"}</div>
+    <div class="bubble"></div>`;
+  m.querySelector(".bubble").textContent = text;
+  if(codeFlag){
+    const f = document.createElement("div");
+    f.className = "codeflag";
+    f.textContent = codeFlag;
+    m.appendChild(f);
+  }
+  t.appendChild(m);
+  t.scrollTop = t.scrollHeight;
+  return m;
+}
+function addThinking(){
+  const t = $("#thread");
+  const m = document.createElement("div");
+  m.className = "msg smith"; m.id = "thinkingMsg";
+  m.innerHTML = `<div class="who">pysmith</div>
+    <div class="thinking">forging<span class="sparks"><i></i><i></i><i></i></span></div>`;
+  t.appendChild(m); t.scrollTop = t.scrollHeight;
+}
+function clearThinking(){ const m = $("#thinkingMsg"); if(m) m.remove(); }
+
+// ---------- send ----------
+const input = $("#input");
+input.addEventListener("input", ()=>{ input.style.height="auto"; input.style.height=Math.min(input.scrollHeight,140)+"px"; });
+input.addEventListener("keydown", e=>{ if(e.key==="Enter" && !e.shiftKey){ e.preventDefault(); send(); }});
+$("#sendBtn").onclick = send;
+
+async function send(forced){
+  const text = forced || input.value.trim();
+  if(!text || state.busy) return;
+  if(!forced){ input.value=""; input.style.height="auto"; }
+  addMsg("you", text);
+  state.messages.push({role:"user", content:text});
+  await converse();
+}
+
+async function converse(){
+  state.busy = true; $("#sendBtn").disabled = true; addThinking();
+  // We send only the conversation; the local server prepends the authoritative
+  // tool-building methodology as the system prompt.
+  let res;
+  try{
+    res = await fetch("/api/chat", {method:"POST",headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({messages: state.messages})}).then(r=>r.json());
+  }catch(e){ res = {error:"Could not reach the local server."}; }
+  clearThinking(); state.busy=false; $("#sendBtn").disabled=false;
+
+  if(res.error){ addMsg("smith", "⚠ " + res.error); return; }
+  $("#modelName").textContent = res.model || $("#modelName").textContent;
+  $("#modelDot").classList.add("on");
+
+  const {prose, code} = splitReply(res.reply);
+  const hadCode = !!code;
+  if(code){
+    loadCode(code);
+    if(state.pendingRelease){ setVersion("release"); state.pendingRelease=false; }
+    else setVersion("testing");
+  }
+  addMsg("smith", prose || (code ? "Here's the build — try it in the test panel." : res.reply),
+         hadCode ? `${state.name}.py updated · ${state.version} version` : null);
+  state.messages.push({role:"assistant", content:res.reply});
+}
+
+function splitReply(reply){
+  const m = reply.match(/```(?:python|py)?\s*\n([\s\S]*?)```/);
+  if(!m) return {prose: reply.trim(), code:null};
+  const code = m[1].replace(/\s+$/,"");
+  const prose = reply.replace(m[0], "").trim();
+  return {prose, code};
+}
+
+// ---------- code pane ----------
+function loadCode(code){
+  state.code = code;
+  guessName(code);
+  $("#codeFile").textContent = state.name + ".py";
+  $("#fileName").textContent = state.name + ".py";
+  renderCode(code);
+  ["copyBtn","saveBtn","runBtn","releaseBtn"].forEach(id=>$("#"+id).disabled=false);
+}
+function guessName(code){
+  // prefer an argparse prog or a obvious function/class, else keep
+  let m = code.match(/add_parser\(['"]([a-z0-9_\-]+)/i) ||
+          code.match(/prog=['"]([a-z0-9_\-]+)/i) ||
+          code.match(/def\s+([a-z0-9_]{3,})\s*\(/i);
+  if(m) state.name = m[1].replace(/[^a-z0-9_\-]/gi,"_");
+}
+function renderCode(code){
+  const body = $("#codeBody");
+  body.innerHTML = "";
+  const pre = document.createElement("pre"); pre.className="code";
+  let html;
+  try{ html = hljs.highlight(code, {language:"python"}).value; }
+  catch(e){ html = code.replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c])); }
+  // wrap each line in .line for the gutter
+  pre.innerHTML = html.split("\n").map(l=>`<span class="line">${l||" "}</span>`).join("");
+  body.appendChild(pre);
+}
+function setVersion(v){
+  state.version = v;
+  const b = $("#verBadge");
+  b.className = "badge " + v;
+  b.textContent = v;
+}
+
+$("#copyBtn").onclick = ()=>{ navigator.clipboard.writeText(state.code||""); toast("Copied to clipboard"); };
+$("#saveBtn").onclick = save;
+$("#releaseBtn").onclick = ()=>{
+  if(!state.code) return;
+  state.pendingRelease = true;
+  send("Produce the release / GitHub version of the current tool — polished: top docstring with usage, a clean argparse CLI, solid error handling and exit codes, comments. Then propose a short README.");
+};
+
+async function save(){
+  if(!state.code) return;
+  const res = await fetch("/api/save",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({code:state.code, name:state.name, kind:state.version})}).then(r=>r.json());
+  if(res.error){ toast("⚠ "+res.error, true); return; }
+  toast("Saved → " + res.path);
+}
+
+// ---------- run ----------
+$("#runBtn").onclick = ()=>run(false);
+async function run(confirmed){
+  if(!state.code) return;
+  const args = $("#args").value.trim();
+  const con = $("#console");
+  con.innerHTML = `<span class="meta">$ python3 ${state.name}.py ${args}</span>\n<span class="placeholder">running…</span>`;
+  const res = await fetch("/api/run",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({code:state.code, args, confirm:confirmed})}).then(r=>r.json());
+
+  if(res.needsConfirm){
+    $("#dangerPatts").textContent = res.patterns.join("   ·   ");
+    $("#dangerScrim").classList.add("on");
+    con.innerHTML = `<span class="placeholder">Blocked pending your confirmation.</span>`;
+    return;
+  }
+  let html = `<span class="meta">$ python3 ${state.name}.py ${args}</span>\n\n`;
+  if(res.stdout) html += `<span class="out">${esc(res.stdout)}</span>`;
+  if(res.stderr) html += `<span class="bad">${esc(res.stderr)}</span>`;
+  if(!res.stdout && !res.stderr) html += `<span class="placeholder">(no output)</span>`;
+  html += `\n<span class="meta">────────────</span>\n`;
+  html += res.exit===0
+      ? `<span class="ok">✓ exit 0 · ${res.seconds}s · clean</span>`
+      : `<span class="bad">✗ exit ${res.exit} · ${res.seconds}s</span>  <span class="meta">— paste the error to me on the left and I'll fix it</span>`;
+  con.innerHTML = html;
+  con.scrollTop = con.scrollHeight;
+
+  // offer the error straight back into the dialogue
+  if(res.exit!==0 && res.stderr){
+    state.lastError = res.stderr;
+  }
+}
+$("#dangerCancel").onclick = ()=>$("#dangerScrim").classList.remove("on");
+$("#dangerConfirm").onclick = ()=>{ $("#dangerScrim").classList.remove("on"); run(true); };
+
+// quick "fix this error" affordance: double-click console error
+$("#console").addEventListener("dblclick", ()=>{
+  if(state.lastError){ send("It failed with this error:\n" + state.lastError); state.lastError=null; }
+});
+
+// ---------- settings ----------
+$("#settingsBtn").onclick = openSettings;
+function openSettings(){ $("#settingsScrim").classList.add("on"); $("#keyInput").focus(); }
+$("#settingsCancel").onclick = ()=>$("#settingsScrim").classList.remove("on");
+$("#settingsSave").onclick = async ()=>{
+  const key = $("#keyInput").value.trim();
+  const res = await fetch("/api/key",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({key})}).then(r=>r.json());
+  $("#settingsScrim").classList.remove("on");
+  if(res.hasKey){ $("#modelDot").classList.add("on"); toast("Key set for this session"); }
+};
+
+// ---------- new ----------
+$("#newBtn").onclick = ()=>{
+  state.messages=[]; state.code=null; state.name="tool"; state.pendingRelease=false; state.lastError=null;
+  setVersion("testing");
+  $("#thread").innerHTML=""; $("#codeFile").textContent="no draft yet"; $("#fileName").textContent="untitled.py";
+  $("#codeBody").innerHTML = `<div class="empty"><img src="/assets/icon.svg" alt=""><h2>Nothing on the anvil yet</h2><p>Describe a tool on the left to begin.</p></div>`;
+  $("#console").innerHTML = `<span class="placeholder">Run output appears here.</span>`;
+  ["copyBtn","saveBtn","runBtn","releaseBtn"].forEach(id=>$("#"+id).disabled=true);
+  greet();
+};
+
+// ---------- util ----------
+function esc(s){ return s.replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c])); }
+let toastT;
+function toast(msg, bad){
+  const el=$("#toast"); el.textContent=msg;
+  el.style.borderLeftColor = bad ? "var(--red)" : "var(--lime)";
+  el.classList.add("show"); clearTimeout(toastT);
+  toastT=setTimeout(()=>el.classList.remove("show"), 2600);
+}
+</script>
+</body>
+</html>
