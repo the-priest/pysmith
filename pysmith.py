@@ -45,8 +45,8 @@ MODELS = [
     "llama-3.3-70b-versatile",
     "openai/gpt-oss-120b",
     "openai/gpt-oss-20b",
-    "llama-3.1-8b-instant",
     "gemma2-9b-it",
+    "llama-3.1-8b-instant",
 ]
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
@@ -97,8 +97,32 @@ DANGER = [
     r"shutil\.rmtree\(\s*os\.path\.expanduser",
 ]
 
-# session state (in memory only)
-STATE = {"key": os.environ.get("GROQ_API_KEY", "").strip()}
+# key persistence: env var wins; otherwise fall back to a local config file
+CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".config", "pysmith", "config.json")
+
+def load_saved_key():
+    try:
+        with open(CONFIG_PATH) as f:
+            return (json.load(f).get("key") or "").strip()
+    except Exception:
+        return ""
+
+def persist_key(key):
+    """Write the key to ~/.config/pysmith/config.json with owner-only perms."""
+    try:
+        os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+        with open(CONFIG_PATH, "w") as f:
+            json.dump({"key": key}, f)
+        try:
+            os.chmod(CONFIG_PATH, 0o600)  # rw for owner only
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+# session state: env var takes priority, then the saved config file
+STATE = {"key": os.environ.get("GROQ_API_KEY", "").strip() or load_saved_key()}
 
 # ==========================================================================
 # helpers
@@ -128,7 +152,15 @@ def call_groq(messages):
                 data = json.loads(resp.read().decode())
             return {"reply": data["choices"][0]["message"]["content"], "model": model}
         except urllib.error.HTTPError as e:
-            last = f"{model}: HTTP {e.code} {e.read().decode(errors='replace')[:160]}"
+            detail = e.read().decode(errors="replace")[:200]
+            if e.code == 403 and "1010" in detail:
+                # Cloudflare edge block, not Groq — same for every model, so bail now
+                return {"error": "Blocked by Cloudflare (403/1010) before reaching Groq. "
+                                 "This is usually a VPN/proxy or an outdated client, not your key."}
+            if e.code == 401:
+                return {"error": "Groq rejected the key (401). Check it in Settings — "
+                                 "it should start with 'gsk_'."}
+            last = f"{model}: HTTP {e.code} {detail}"
         except Exception as e:
             last = f"{model}: {e}"
     return {"error": "Model chain failed. Last: " + str(last)}
@@ -228,7 +260,8 @@ class Handler(BaseHTTPRequestHandler):
 
         if self.path == "/api/key":
             STATE["key"] = (data.get("key") or "").strip()
-            self._send(200, {"hasKey": bool(STATE["key"])})
+            saved = persist_key(STATE["key"]) if STATE["key"] else False
+            self._send(200, {"hasKey": bool(STATE["key"]), "saved": saved})
         elif self.path == "/api/chat":
             # The methodology prompt is authoritative and lives here, server-side.
             # We drop any system message the client sent and prepend our own.
@@ -258,8 +291,14 @@ def main():
     port = free_port(HOST, PORT)
     url = f"http://{HOST}:{port}"
     srv = ThreadingHTTPServer((HOST, port), Handler)
+    if os.environ.get("GROQ_API_KEY", "").strip():
+        src = "loaded from env"
+    elif STATE["key"]:
+        src = "loaded from saved config"
+    else:
+        src = "not set (add it in Settings)"
     print(f"\n  pysmith v{__version__}  \u2014  {url}")
-    print(f"  Groq key: {'loaded from env' if STATE['key'] else 'not set (add it in Settings)'}")
+    print(f"  Groq key: {src}")
     print(f"  serving local-only. ctrl-c to stop.\n")
     try:
         webbrowser.open(url)

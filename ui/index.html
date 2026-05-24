@@ -390,7 +390,9 @@ async function converse(){
 }
 
 function splitReply(reply){
-  const m = reply.match(/```(?:python|py)?\s*\n([\s\S]*?)```/);
+  // prefer a python-tagged block; fall back to any fenced block
+  let m = reply.match(/```(?:python|py)\s*\n([\s\S]*?)```/i)
+       || reply.match(/```\s*\n([\s\S]*?)```/);
   if(!m) return {prose: reply.trim(), code:null};
   const code = m[1].replace(/\s+$/,"");
   const prose = reply.replace(m[0], "").trim();
@@ -489,14 +491,31 @@ $("#console").addEventListener("dblclick", ()=>{
 
 // ---------- settings ----------
 $("#settingsBtn").onclick = openSettings;
-function openSettings(){ $("#settingsScrim").classList.add("on"); $("#keyInput").focus(); }
+function openSettings(){
+  $("#settingsScrim").classList.add("on");
+  // reflect whether a key is already stored, without revealing it
+  fetch("/api/status").then(r=>r.json()).then(s=>{
+    $("#keyInput").placeholder = s.hasKey ? "A key is already saved — paste a new one to replace it" : "gsk_…";
+  }).catch(()=>{});
+  $("#keyInput").focus();
+}
 $("#settingsCancel").onclick = ()=>$("#settingsScrim").classList.remove("on");
 $("#settingsSave").onclick = async ()=>{
   const key = $("#keyInput").value.trim();
-  const res = await fetch("/api/key",{method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({key})}).then(r=>r.json());
+  if(!key){ toast("Paste a key first", true); return; }
+  let res;
+  try{
+    res = await fetch("/api/key",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({key})}).then(r=>r.json());
+  }catch(e){ toast("Couldn't reach the local server", true); return; }
   $("#settingsScrim").classList.remove("on");
-  if(res.hasKey){ $("#modelDot").classList.add("on"); toast("Key set for this session"); }
+  $("#keyInput").value = "";
+  if(res.hasKey){
+    $("#modelDot").classList.add("on");
+    toast(res.saved ? "Key saved — it'll persist across restarts" : "Key set for this session (couldn't write config file)");
+  }else{
+    toast("Key not accepted", true);
+  }
 };
 
 // ---------- new ----------
