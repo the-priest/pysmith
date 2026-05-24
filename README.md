@@ -94,11 +94,23 @@ real tools), so take the review step seriously.
 
 Top of `pysmith.py`:
 
-- **`MODELS`** — Groq fallback chain, biggest → smallest. Defaults are reasonable; Groq's
-  catalogue shifts, so **paste your own verified model strings here.**
+- **`PROVIDERS`** — the providers pysmith can call (Anthropic, OpenAI, Groq) and the
+  model chain for each, biggest → smallest. You pick the active one per session from the
+  dropdown in the app; a failed call falls through that provider's chain. Edit the model
+  strings to match what your accounts actually have access to.
+- **`DEFAULT_PROVIDER`** — which provider is active on first launch.
+- **`AUTOTEST_MAX_ROUNDS`** — after the model writes code, pysmith silently syntax-checks
+  and smoke-tests it, feeding failures back to the model up to this many times *before you
+  see it*. This is the main quality lever — a weaker model forced to fix its own mistakes
+  beats a stronger one that never checks.
 - **`SYSTEM_PROMPT`** — the tool-building method. Tighten to taste.
 - **`DANGER`** — the destructive-pattern tripwires.
 - **`PORT`** — default `8765` (auto-bumps if taken).
+
+Keys are read from each provider's env var (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
+`GROQ_API_KEY`) or pasted per-provider in Settings, then persisted to an owner-only
+config file at `~/.config/pysmith/config.json`.
+
 
 ---
 

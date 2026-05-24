@@ -54,6 +54,9 @@
     display:flex;align-items:center;gap:7px}
   .model-pill .dot{width:7px;height:7px;border-radius:50%;background:var(--faint)}
   .model-pill .dot.on{background:var(--lime);box-shadow:0 0 7px var(--lime)}
+  .provider-pick{background:var(--panel);border:1px solid var(--line);border-radius:8px;color:var(--ink);
+    font-family:var(--ui);font-size:12px;padding:6px 9px;cursor:pointer;outline:none}
+  .provider-pick:hover{border-color:var(--amber)}
   .icon-btn{background:var(--panel);border:1px solid var(--line);border-radius:8px;color:var(--dim);
     width:34px;height:34px;cursor:pointer;font-size:15px;transition:.13s;display:grid;place-items:center}
   .icon-btn:hover{color:var(--ink);border-color:var(--amber)}
@@ -201,6 +204,7 @@
       <span class="badge testing" id="verBadge">testing</span>
     </div>
     <div class="spacer"></div>
+    <select id="providerPick" class="provider-pick" title="Which model builds your tools"></select>
     <div class="model-pill"><span class="dot" id="modelDot"></span><span id="modelName">connecting…</span></div>
     <button class="icon-btn" id="settingsBtn" title="Settings">⚙</button>
   </div>
@@ -264,10 +268,12 @@
 <div class="scrim" id="settingsScrim">
   <div class="modal">
     <h3>Settings</h3>
-    <p>Your Groq key stays on this machine (in the local pysmith process) and is never sent to the browser or saved to disk.</p>
-    <label>Groq API key</label>
-    <input type="password" id="keyInput" placeholder="gsk_…">
-    <p style="font-size:12px">Model chain is set in <span style="font-family:var(--mono);color:var(--amber)">pysmith.py</span> → <span style="font-family:var(--mono)">MODELS</span>.</p>
+    <p>Keys stay on this machine (in the local pysmith process), are never sent to the browser, and persist to an owner-only config file. Each provider has its own key.</p>
+    <label>Provider</label>
+    <select id="keyProvider" class="provider-pick" style="width:100%;margin-bottom:14px"></select>
+    <label>API key for the selected provider</label>
+    <input type="password" id="keyInput" placeholder="paste key…">
+    <p style="font-size:12px">Models per provider are set in <span style="font-family:var(--mono);color:var(--amber)">pysmith.py</span> → <span style="font-family:var(--mono)">PROVIDERS</span>. Auto-test fix rounds: <span style="font-family:var(--mono)">AUTOTEST_MAX_ROUNDS</span>.</p>
     <div class="acts">
       <button class="btn ghost" id="settingsCancel">cancel</button>
       <button class="btn" id="settingsSave">save key</button>
@@ -304,16 +310,35 @@ let state = {
 };
 
 // ---------- boot ----------
+let providers = [];
 init();
 async function init(){
   try{
     const s = await fetch("/api/status").then(r=>r.json());
+    providers = s.providers || [];
+    const pick = $("#providerPick");
+    pick.innerHTML = providers.map(p=>
+      `<option value="${p.id}" ${p.id===s.provider?"selected":""}>${p.label}${p.hasKey?"":" (no key)"}</option>`
+    ).join("");
     $("#modelName").textContent = s.model || "ready";
-    if(s.hasKey){ $("#modelDot").classList.add("on"); }
-    else { openSettings(); }
+    reflectKey(s.hasKey);
+    if(!s.hasKey) openSettings();
   }catch(e){ $("#modelName").textContent = "server offline"; }
   greet();
 }
+function reflectKey(has){ $("#modelDot").classList.toggle("on", !!has); }
+
+$("#providerPick").onchange = async (e)=>{
+  const pid = e.target.value;
+  try{
+    const r = await fetch("/api/provider",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({provider:pid})}).then(r=>r.json());
+    $("#modelName").textContent = r.model || pid;
+    reflectKey(r.hasKey);
+    if(!r.hasKey){ toast("No key for that provider yet — add one in Settings", true); openSettings(); }
+    else toast("Switched to " + (providers.find(p=>p.id===pid)?.label||pid));
+  }catch(err){ toast("Couldn't switch provider", true); }
+};
 
 function greet(){
   addMsg("smith", "Right — what do you want to build? Tell me the job in plain English and I'll either ask a couple of sharp questions or lay out a quick plan. Once we agree, I forge a testing version you can run on the spot.");
@@ -369,7 +394,7 @@ async function converse(){
   let res;
   try{
     res = await fetch("/api/chat", {method:"POST",headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({messages: state.messages})}).then(r=>r.json());
+      body: JSON.stringify({messages: state.messages, provider: $("#providerPick").value})}).then(r=>r.json());
   }catch(e){ res = {error:"Could not reach the local server."}; }
   clearThinking(); state.busy=false; $("#sendBtn").disabled=false;
 
@@ -384,8 +409,22 @@ async function converse(){
     if(state.pendingRelease){ setVersion("release"); state.pendingRelease=false; }
     else setVersion("testing");
   }
-  addMsg("smith", prose || (code ? "Here's the build — try it in the test panel." : res.reply),
-         hadCode ? `${state.name}.py updated · ${state.version} version` : null);
+  // build the code flag, including auto-test result if it ran
+  let flag = null;
+  if(hadCode){
+    flag = `${state.name}.py updated · ${state.version} version`;
+    const at = res.autotest;
+    if(at && at.ran){
+      const rounds = (at.rounds||[]).length;
+      if(at.passed){
+        flag += rounds>1 ? `  ·  ✓ auto-tested (fixed in ${rounds-1} round${rounds-1>1?"s":""})`
+                         : `  ·  ✓ auto-tested`;
+      }else{
+        flag += `  ·  ⚠ auto-test still failing after ${rounds} tr${rounds>1?"ies":"y"} — run it to see`;
+      }
+    }
+  }
+  addMsg("smith", prose || (code ? "Here's the build — try it in the test panel." : res.reply), flag);
   state.messages.push({role:"assistant", content:res.reply});
 }
 
@@ -443,8 +482,11 @@ $("#releaseBtn").onclick = ()=>{
 
 async function save(){
   if(!state.code) return;
-  const res = await fetch("/api/save",{method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({code:state.code, name:state.name, kind:state.version})}).then(r=>r.json());
+  let res;
+  try{
+    res = await fetch("/api/save",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({code:state.code, name:state.name, kind:state.version})}).then(r=>r.json());
+  }catch(e){ toast("Couldn't reach the local server", true); return; }
   if(res.error){ toast("⚠ "+res.error, true); return; }
   toast("Saved → " + res.path);
 }
@@ -455,9 +497,16 @@ async function run(confirmed){
   if(!state.code) return;
   const args = $("#args").value.trim();
   const con = $("#console");
-  con.innerHTML = `<span class="meta">$ python3 ${state.name}.py ${args}</span>\n<span class="placeholder">running…</span>`;
-  const res = await fetch("/api/run",{method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({code:state.code, args, confirm:confirmed})}).then(r=>r.json());
+  const cmdLine = `$ python3 ${esc(state.name)}.py ${esc(args)}`;
+  con.innerHTML = `<span class="meta">${cmdLine}</span>\n<span class="placeholder">running…</span>`;
+  let res;
+  try{
+    res = await fetch("/api/run",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({code:state.code, args, confirm:confirmed})}).then(r=>r.json());
+  }catch(e){
+    con.innerHTML = `<span class="meta">${cmdLine}</span>\n\n<span class="bad">Couldn't reach the local pysmith server. Is it still running in your terminal?</span>`;
+    return;
+  }
 
   if(res.needsConfirm){
     $("#dangerPatts").textContent = res.patterns.join("   ·   ");
@@ -465,7 +514,11 @@ async function run(confirmed){
     con.innerHTML = `<span class="placeholder">Blocked pending your confirmation.</span>`;
     return;
   }
-  let html = `<span class="meta">$ python3 ${state.name}.py ${args}</span>\n\n`;
+  if(res.error){
+    con.innerHTML = `<span class="meta">${cmdLine}</span>\n\n<span class="bad">${esc(res.error)}</span>`;
+    return;
+  }
+  let html = `<span class="meta">${cmdLine}</span>\n\n`;
   if(res.stdout) html += `<span class="out">${esc(res.stdout)}</span>`;
   if(res.stderr) html += `<span class="bad">${esc(res.stderr)}</span>`;
   if(!res.stdout && !res.stderr) html += `<span class="placeholder">(no output)</span>`;
@@ -493,26 +546,37 @@ $("#console").addEventListener("dblclick", ()=>{
 $("#settingsBtn").onclick = openSettings;
 function openSettings(){
   $("#settingsScrim").classList.add("on");
-  // reflect whether a key is already stored, without revealing it
+  // populate the provider dropdown, defaulting to the active one
   fetch("/api/status").then(r=>r.json()).then(s=>{
-    $("#keyInput").placeholder = s.hasKey ? "A key is already saved — paste a new one to replace it" : "gsk_…";
+    const kp = $("#keyProvider");
+    kp.innerHTML = (s.providers||[]).map(p=>
+      `<option value="${p.id}" ${p.id===s.provider?"selected":""}>${p.label}${p.hasKey?" ✓":""}</option>`
+    ).join("");
+    updateKeyPlaceholder(s.providers, kp.value);
+    kp.onchange = ()=>updateKeyPlaceholder(s.providers, kp.value);
   }).catch(()=>{});
   $("#keyInput").focus();
+}
+function updateKeyPlaceholder(provs, pid){
+  const p = (provs||[]).find(x=>x.id===pid);
+  $("#keyInput").placeholder = (p && p.hasKey) ? "A key is already saved — paste to replace" : "paste key…";
 }
 $("#settingsCancel").onclick = ()=>$("#settingsScrim").classList.remove("on");
 $("#settingsSave").onclick = async ()=>{
   const key = $("#keyInput").value.trim();
+  const provider = $("#keyProvider").value;
   if(!key){ toast("Paste a key first", true); return; }
   let res;
   try{
     res = await fetch("/api/key",{method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({key})}).then(r=>r.json());
+      body:JSON.stringify({key, provider})}).then(r=>r.json());
   }catch(e){ toast("Couldn't reach the local server", true); return; }
   $("#settingsScrim").classList.remove("on");
   $("#keyInput").value = "";
   if(res.hasKey){
-    $("#modelDot").classList.add("on");
-    toast(res.saved ? "Key saved — it'll persist across restarts" : "Key set for this session (couldn't write config file)");
+    toast(res.saved ? "Key saved — persists across restarts" : "Key set for this session");
+    // refresh picker labels + dot
+    init();
   }else{
     toast("Key not accepted", true);
   }
@@ -530,7 +594,7 @@ $("#newBtn").onclick = ()=>{
 };
 
 // ---------- util ----------
-function esc(s){ return s.replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c])); }
+function esc(s){ return String(s==null?"":s).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c])); }
 let toastT;
 function toast(msg, bad){
   const el=$("#toast"); el.textContent=msg;
