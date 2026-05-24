@@ -117,7 +117,12 @@ def call_groq(messages):
         req = urllib.request.Request(
             GROQ_URL, data=body,
             headers={"Content-Type": "application/json",
-                     "Authorization": "Bearer " + key})
+                     "Authorization": "Bearer " + key,
+                     # Cloudflare in front of the API rejects the default
+                     # Python-urllib User-Agent with 403 (code 1010), so we
+                     # present as a normal client.
+                     "User-Agent": f"pysmith/{__version__}",
+                     "Accept": "application/json"})
         try:
             with urllib.request.urlopen(req, timeout=120) as resp:
                 data = json.loads(resp.read().decode())
