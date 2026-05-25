@@ -362,7 +362,9 @@
     <select id="keyProvider" class="provider-pick" style="width:100%;margin-bottom:14px"></select>
     <label>API key for the selected provider</label>
     <input type="password" id="keyInput" placeholder="paste key…">
-    <p style="font-size:12px">Models per provider are set in <span style="font-family:var(--mono);color:var(--amber)">pysmith.py</span> → <span style="font-family:var(--mono)">PROVIDERS</span>. Auto-test fix rounds: <span style="font-family:var(--mono)">AUTOTEST_MAX_ROUNDS</span>.</p>
+    <label>Model (biggest first — pick one to pin it)</label>
+    <select id="keyModel" class="provider-pick" style="width:100%;margin-bottom:14px"></select>
+    <p style="font-size:12px">Models are listed biggest→strongest first. Edit the lists in <span style="font-family:var(--mono);color:var(--amber)">pysmith.py</span> → <span style="font-family:var(--mono)">PROVIDERS</span> if needed. Auto-test rounds: <span style="font-family:var(--mono)">AUTOTEST_MAX_ROUNDS</span>.</p>
     <div class="acts">
       <button class="btn ghost" id="settingsCancel">cancel</button>
       <button class="btn" id="settingsSave">save key</button>
@@ -1018,42 +1020,55 @@ $("#console").addEventListener("dblclick", ()=>{
 
 // ---------- settings ----------
 $("#settingsBtn").onclick = openSettings;
+let _settingsProvs = [];
 function openSettings(){
   $("#settingsScrim").classList.add("on");
-  // populate the provider dropdown, defaulting to the active one
   fetch("/api/status").then(r=>r.json()).then(s=>{
+    _settingsProvs = s.providers||[];
     const kp = $("#keyProvider");
-    kp.innerHTML = (s.providers||[]).map(p=>
+    kp.innerHTML = _settingsProvs.map(p=>
       `<option value="${p.id}" ${p.id===s.provider?"selected":""}>${p.label}${p.hasKey?" ✓":""}</option>`
     ).join("");
-    updateKeyPlaceholder(s.providers, kp.value);
-    kp.onchange = ()=>updateKeyPlaceholder(s.providers, kp.value);
+    const refresh = ()=>{ updateKeyPlaceholder(_settingsProvs, kp.value); populateModels(kp.value); };
+    refresh();
+    kp.onchange = refresh;
   }).catch(()=>{});
   $("#keyInput").focus();
 }
+function populateModels(pid){
+  const p = _settingsProvs.find(x=>x.id===pid);
+  if(!p){ $("#keyModel").innerHTML=""; return; }
+  $("#keyModel").innerHTML = p.models.map((m,i)=>
+    `<option value="${escapeHtml(m)}" ${m===p.chosen?"selected":""}>${escapeHtml(m)}${i===0?"  (biggest)":""}</option>`
+  ).join("");
+}
 function updateKeyPlaceholder(provs, pid){
   const p = (provs||[]).find(x=>x.id===pid);
-  $("#keyInput").placeholder = (p && p.hasKey) ? "A key is already saved — paste to replace" : "paste key…";
+  $("#keyInput").placeholder = (p && p.hasKey) ? "A key is already saved — leave blank to keep it" : "paste key…";
 }
 $("#settingsCancel").onclick = ()=>$("#settingsScrim").classList.remove("on");
 $("#settingsSave").onclick = async ()=>{
   const key = $("#keyInput").value.trim();
   const provider = $("#keyProvider").value;
-  if(!key){ toast("Paste a key first", true); return; }
-  let res;
+  const model = $("#keyModel").value;
+  const p = _settingsProvs.find(x=>x.id===provider);
+  // require a key only if this provider has none yet
+  if(!key && !(p && p.hasKey)){ toast("Paste a key for this provider first", true); return; }
   try{
-    res = await fetch("/api/key",{method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({key, provider})}).then(r=>r.json());
+    if(key){
+      const res = await fetch("/api/key",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({key, provider})}).then(r=>r.json());
+      if(!res.hasKey){ toast("Key not accepted", true); return; }
+    }
+    if(model){
+      await fetch("/api/model",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({provider, model})});
+    }
   }catch(e){ toast("Couldn't reach the local server", true); return; }
   $("#settingsScrim").classList.remove("on");
   $("#keyInput").value = "";
-  if(res.hasKey){
-    toast(res.saved ? "Key saved — persists across restarts" : "Key set for this session");
-    // refresh picker labels + dot
-    init();
-  }else{
-    toast("Key not accepted", true);
-  }
+  toast("Saved" + (model?` · model: ${model.split("/").pop()}`:""));
+  init();
 };
 
 // ---------- new ----------

@@ -33,7 +33,7 @@ import urllib.request
 import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-__version__ = "5.0.0"
+__version__ = "6.0.0"
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 # ==========================================================================
@@ -50,25 +50,11 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 #
 # >>> Edit model strings to match what your accounts actually have access to. <<<
 PROVIDERS = {
-    "anthropic": {
-        "label": "Anthropic (Claude)",
-        "url": "https://api.anthropic.com/v1/messages",
-        "env": "ANTHROPIC_API_KEY",
-        "kind": "anthropic",                       # distinct request/response shape
-        "models": ["claude-opus-4-7", "claude-sonnet-4-6"],
-    },
-    "openai": {
-        "label": "OpenAI (GPT)",
-        "url": "https://api.openai.com/v1/chat/completions",
-        "env": "OPENAI_API_KEY",
-        "kind": "openai",                          # openai-style chat completions
-        "models": ["gpt-4o", "gpt-4o-mini"],
-    },
     "groq": {
-        "label": "Groq (fast fallback)",
+        "label": "Groq",
         "url": "https://api.groq.com/openai/v1/chat/completions",
         "env": "GROQ_API_KEY",
-        "kind": "openai",                          # groq speaks the openai shape
+        "kind": "openai",
         "models": [
             "llama-3.3-70b-versatile",
             "openai/gpt-oss-120b",
@@ -77,10 +63,50 @@ PROVIDERS = {
             "llama-3.1-8b-instant",
         ],
     },
+    "siliconflow": {
+        "label": "SiliconFlow",
+        "url": "https://api.siliconflow.com/v1/chat/completions",
+        "env": "SILICONFLOW_API_KEY",
+        "kind": "openai",
+        # biggest / strongest first
+        "models": [
+            "deepseek-ai/DeepSeek-V3",
+            "Qwen/Qwen2.5-Coder-32B-Instruct",
+            "Qwen/Qwen2.5-72B-Instruct",
+            "deepseek-ai/DeepSeek-V2.5",
+            "Qwen/Qwen2.5-7B-Instruct",
+        ],
+    },
+    "google": {
+        "label": "Google AI Studio",
+        "url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+        "env": "GOOGLE_API_KEY",
+        "kind": "openai",   # google exposes an OpenAI-compatible endpoint
+        "models": [
+            "gemini-2.5-pro",
+            "gemini-2.5-flash",
+            "gemini-2.0-flash",
+            "gemini-1.5-pro",
+            "gemini-1.5-flash",
+        ],
+    },
+    "novita": {
+        "label": "Novita AI",
+        "url": "https://api.novita.ai/v3/openai/chat/completions",
+        "env": "NOVITA_API_KEY",
+        "kind": "openai",
+        "models": [
+            "deepseek/deepseek-v3",
+            "qwen/qwen-2.5-72b-instruct",
+            "meta-llama/llama-3.1-70b-instruct",
+            "openai/gpt-oss-120b",
+            "meta-llama/llama-3.1-8b-instruct",
+        ],
+    },
 }
 
-# default provider when the user hasn't picked one
-DEFAULT_PROVIDER = "anthropic"
+# default provider on first launch
+DEFAULT_PROVIDER = "groq"
 
 # auto-test loop: after the model writes code, pysmith silently checks it and
 # feeds failures back to the model up to this many times before showing you.
@@ -212,14 +238,16 @@ def _initial_keys():
         keys[pid] = os.environ.get(p["env"], "").strip() or (saved.get(pid) or "").strip()
     return keys
 
-# session state: per-provider keys + the currently selected provider
+# session state: per-provider keys + the currently selected provider + chosen model per provider
 STATE = {
     "keys": _initial_keys(),
     "provider": load_config().get("provider") or DEFAULT_PROVIDER,
+    "models": load_config().get("models", {}),   # {provider_id: chosen_model}
 }
 
 def persist_state():
-    return save_config({"keys": STATE["keys"], "provider": STATE["provider"]})
+    return save_config({"keys": STATE["keys"], "provider": STATE["provider"],
+                        "models": STATE["models"]})
 
 # --------------------------------------------------------------------------
 # TOOL LIBRARY  -- persistent, reloadable tools (code + conversation)
@@ -328,17 +356,6 @@ def _http_post(url, headers, body, timeout=120):
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode())
 
-def _split_system(messages):
-    """Pull a leading system message out; return (system_text, rest)."""
-    sys_txt = ""
-    rest = []
-    for m in messages:
-        if m.get("role") == "system" and not rest:
-            sys_txt = m.get("content", "")
-        else:
-            rest.append(m)
-    return sys_txt, rest
-
 def call_model(messages, provider_id=None):
     """Call the selected provider, falling through its model chain on error.
     Returns {"reply", "model", "provider"} or {"error"}."""
@@ -351,36 +368,24 @@ def call_model(messages, provider_id=None):
         return {"error": f"No API key for {prov['label']}. Add it in Settings, "
                          f"or set {prov['env']} and restart."}
 
+    # model order: a user-chosen model (if set) first, then the rest of the chain
+    chosen = STATE.get("models", {}).get(pid)
+    chain = list(prov["models"])
+    if chosen:
+        chain = [chosen] + [m for m in chain if m != chosen]
+
     last = None
-    for model in prov["models"]:
+    for model in chain:
         try:
-            if prov["kind"] == "anthropic":
-                sys_txt, convo = _split_system(messages)
-                headers = {
-                    "Content-Type": "application/json",
-                    "x-api-key": key,
-                    "anthropic-version": "2023-06-01",
-                    "User-Agent": f"pysmith/{__version__}",
-                }
-                body = {"model": model, "max_tokens": 4096, "temperature": 0.3,
-                        "messages": convo}
-                if sys_txt:
-                    body["system"] = sys_txt
-                data = _http_post(prov["url"], headers, body)
-                # anthropic returns content as a list of blocks
-                parts = [b.get("text", "") for b in data.get("content", [])
-                         if b.get("type") == "text"]
-                reply = "".join(parts)
-            else:  # openai-style (openai + groq)
-                headers = {
-                    "Content-Type": "application/json",
-                    "Authorization": "Bearer " + key,
-                    "User-Agent": f"pysmith/{__version__}",
-                    "Accept": "application/json",
-                }
-                body = {"model": model, "temperature": 0.3, "messages": messages}
-                data = _http_post(prov["url"], headers, body)
-                reply = data["choices"][0]["message"]["content"]
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": "Bearer " + key,
+                "User-Agent": f"pysmith/{__version__}",
+                "Accept": "application/json",
+            }
+            body = {"model": model, "temperature": 0.3, "messages": messages}
+            data = _http_post(prov["url"], headers, body)
+            reply = data["choices"][0]["message"]["content"]
             return {"reply": reply, "model": model, "provider": pid}
         except urllib.error.HTTPError as e:
             detail = e.read().decode(errors="replace")[:200]
@@ -389,9 +394,9 @@ def call_model(messages, provider_id=None):
                                  f"{prov['label']}. Usually a VPN/proxy or outdated client, not your key."}
             if e.code == 401:
                 return {"error": f"{prov['label']} rejected the key (401). Check it in Settings."}
-            if e.code == 404:
-                # model not available to this account — try the next in the chain
-                last = f"{model}: 404 (model not available to your account?)"
+            if e.code in (404, 400):
+                # model not available to this account/plan — try the next in the chain
+                last = f"{model}: HTTP {e.code} (model unavailable on your plan?)"
                 continue
             last = f"{model}: HTTP {e.code} {detail}"
         except Exception as e:
@@ -579,8 +584,10 @@ def run_code(code, args, confirmed):
 
 def save_tool(code, name, kind):
     name = re.sub(r"[^A-Za-z0-9_\-]", "_", (name or "tool")).strip("_") or "tool"
+    # save under a fixed, predictable home location (never the volatile cwd)
+    base = os.path.join(os.path.expanduser("~"), "pysmith-tools")
     if kind == "release":
-        d = os.path.join(os.getcwd(), "release", name)
+        d = os.path.join(base, "release", name)
         os.makedirs(d, exist_ok=True)
         pyp = os.path.join(d, name + ".py")
         with open(pyp, "w") as f:
@@ -593,7 +600,7 @@ def save_tool(code, name, kind):
                 f.write(f"# {name}\n\nBuilt with pysmith.\n\n## Usage\n\n```bash\npython3 {name}.py\n```\n")
         return {"path": d}
     else:
-        d = os.path.join(os.getcwd(), "forge")
+        d = os.path.join(base, "forge")
         os.makedirs(d, exist_ok=True)
         pyp = os.path.join(d, name + ".py")
         with open(pyp, "w") as f:
@@ -673,7 +680,7 @@ def write_github_repo(code, name, gh, details):
     license_name = details.get("license", "MIT")
     holder = details.get("holder", user)
 
-    d = os.path.join(os.getcwd(), "github", repo)
+    d = os.path.join(os.path.expanduser("~"), "pysmith-tools", "github", repo)
     os.makedirs(d, exist_ok=True)
 
     # main script
@@ -828,13 +835,16 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/api/status":
             provs = [{"id": pid, "label": p["label"],
                       "hasKey": bool(STATE["keys"].get(pid)),
+                      "models": p["models"],
+                      "chosen": STATE["models"].get(pid) or p["models"][0],
                       "topModel": p["models"][0]}
                      for pid, p in PROVIDERS.items()]
             cur = PROVIDERS.get(STATE["provider"], {})
+            chosen_cur = STATE["models"].get(STATE["provider"]) or (cur.get("models") or ["?"])[0]
             self._send(200, {
                 "providers": provs,
                 "provider": STATE["provider"],
-                "model": (cur.get("models") or ["?"])[0],
+                "model": chosen_cur,
                 "hasKey": bool(STATE["keys"].get(STATE["provider"])),
                 "autotest": AUTOTEST_MAX_ROUNDS,
                 "version": __version__,
@@ -876,7 +886,18 @@ class Handler(BaseHTTPRequestHandler):
             STATE["provider"] = pid
             persist_state()
             self._send(200, {"provider": pid, "hasKey": bool(STATE["keys"].get(pid)),
-                             "model": PROVIDERS[pid]["models"][0]})
+                             "model": STATE["models"].get(pid) or PROVIDERS[pid]["models"][0]})
+        elif self.path == "/api/model":
+            pid = data.get("provider") or STATE["provider"]
+            model = data.get("model")
+            if pid not in PROVIDERS:
+                return self._send(200, {"error": "unknown provider"})
+            if model and model in PROVIDERS[pid]["models"]:
+                STATE["models"][pid] = model
+                persist_state()
+                self._send(200, {"provider": pid, "model": model})
+            else:
+                self._send(200, {"error": "unknown model for this provider"})
         elif self.path == "/api/chat":
             # The methodology prompt is authoritative and lives here, server-side.
             convo = [m for m in data.get("messages", []) if m.get("role") != "system"]
