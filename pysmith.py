@@ -33,7 +33,7 @@ import urllib.request
 import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-__version__ = "4.0.0"
+__version__ = "5.0.0"
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 # ==========================================================================
@@ -220,6 +220,102 @@ STATE = {
 
 def persist_state():
     return save_config({"keys": STATE["keys"], "provider": STATE["provider"]})
+
+# --------------------------------------------------------------------------
+# TOOL LIBRARY  -- persistent, reloadable tools (code + conversation)
+# --------------------------------------------------------------------------
+LIBRARY_DIR = os.path.join(os.path.expanduser("~"), ".local", "share", "pysmith", "library")
+
+def _safe_id(name):
+    return re.sub(r"[^A-Za-z0-9_\-]", "_", (name or "tool")).strip("_") or "tool"
+
+def library_save(name, code, messages):
+    """Persist a tool (its code + the conversation that built it) to the library."""
+    os.makedirs(LIBRARY_DIR, exist_ok=True)
+    tid = _safe_id(name)
+    rec = {"id": tid, "name": name or tid, "code": code,
+           "messages": messages or [], "saved": time.strftime("%Y-%m-%d %H:%M")}
+    with open(os.path.join(LIBRARY_DIR, tid + ".json"), "w") as f:
+        json.dump(rec, f)
+    return {"id": tid, "saved": rec["saved"]}
+
+def library_list():
+    if not os.path.isdir(LIBRARY_DIR):
+        return {"tools": []}
+    tools = []
+    for fn in os.listdir(LIBRARY_DIR):
+        if not fn.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(LIBRARY_DIR, fn)) as f:
+                r = json.load(f)
+            tools.append({"id": r.get("id"), "name": r.get("name"),
+                          "saved": r.get("saved"),
+                          "lines": len((r.get("code") or "").splitlines())})
+        except Exception:
+            continue
+    tools.sort(key=lambda t: t.get("saved", ""), reverse=True)
+    return {"tools": tools}
+
+def library_load(tid):
+    path = os.path.join(LIBRARY_DIR, _safe_id(tid) + ".json")
+    if not os.path.exists(path):
+        return {"error": "not found"}
+    with open(path) as f:
+        return {"tool": json.load(f)}
+
+def library_delete(tid):
+    path = os.path.join(LIBRARY_DIR, _safe_id(tid) + ".json")
+    try:
+        os.remove(path); return {"ok": True}
+    except Exception as e:
+        return {"error": str(e)}
+
+# --------------------------------------------------------------------------
+# DEPENDENCIES  -- detect third-party imports, optionally install into a venv
+# --------------------------------------------------------------------------
+def detect_deps(code):
+    """Return third-party top-level imports (best-effort, stdlib-aware)."""
+    std = getattr(sys, "stdlib_module_names", set())
+    obvious = {"os","sys","re","io","json","time","math","socket","subprocess","argparse",
+               "itertools","collections","random","hashlib","base64","struct","threading",
+               "datetime","pathlib","shutil","csv","urllib","textwrap","glob","tempfile",
+               "functools","typing","enum","dataclasses","queue","signal","select","ssl",
+               "ipaddress","binascii","zlib","gzip","sqlite3","html","xml","http","email"}
+    mods = set()
+    for m in re.finditer(r"^\s*(?:import|from)\s+([a-zA-Z0-9_\.]+)", code, re.M):
+        top = m.group(1).split(".")[0]
+        if top and top not in std and top not in obvious and not top.startswith("_"):
+            mods.add(top)
+    return sorted(mods)
+
+VENV_DIR = os.path.join(os.path.expanduser("~"), ".local", "share", "pysmith", "venv")
+
+def install_deps(pkgs):
+    """Install packages into pysmith's managed venv. Returns log + the python path."""
+    if not pkgs:
+        return {"ok": True, "log": "no third-party packages — pure stdlib", "python": sys.executable}
+    try:
+        if not os.path.isdir(VENV_DIR):
+            import venv
+            venv.EnvBuilder(with_pip=True).create(VENV_DIR)
+        vpy = os.path.join(VENV_DIR, "bin", "python")
+        if not os.path.exists(vpy):
+            vpy = os.path.join(VENV_DIR, "Scripts", "python.exe")  # windows fallback
+        proc = subprocess.run([vpy, "-m", "pip", "install", *pkgs],
+                              capture_output=True, text=True, timeout=300)
+        out = (proc.stdout or "") + (proc.stderr or "")
+        return {"ok": proc.returncode == 0, "log": out[-1500:], "python": vpy}
+    except Exception as e:
+        return {"ok": False, "log": f"venv/install failed: {e}", "python": sys.executable}
+
+# the interpreter used to run tools: the venv if it exists, else current
+def run_python():
+    for cand in (os.path.join(VENV_DIR, "bin", "python"),
+                 os.path.join(VENV_DIR, "Scripts", "python.exe")):
+        if os.path.exists(cand):
+            return cand
+    return sys.executable
 
 # ==========================================================================
 # helpers
@@ -456,7 +552,7 @@ def run_code(code, args, confirmed):
         t0 = time.time()
         try:
             proc = subprocess.run(
-                [sys.executable, path] + argv,
+                [run_python(), path] + argv,
                 capture_output=True,           # capture as bytes, decode ourselves
                 stdin=subprocess.DEVNULL,      # no stdin -> input() gets clean EOF, never hangs
                 timeout=120)
@@ -745,6 +841,8 @@ class Handler(BaseHTTPRequestHandler):
             })
         elif self.path == "/api/log":
             self._send(200, {"log": render_log(full=True), "runs": len(SESSION_LOG)})
+        elif self.path == "/api/library":
+            self._send(200, library_list())
         elif self.path == "/api/log.txt":
             blob = render_log(full=True).encode()
             self.send_response(200)
@@ -809,6 +907,17 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/api/log.clear":
             SESSION_LOG.clear()
             self._send(200, {"runs": 0})
+        elif self.path == "/api/library/save":
+            self._send(200, library_save(data.get("name", "tool"), data.get("code", ""),
+                                         data.get("messages", [])))
+        elif self.path == "/api/library/load":
+            self._send(200, library_load(data.get("id", "")))
+        elif self.path == "/api/library/delete":
+            self._send(200, library_delete(data.get("id", "")))
+        elif self.path == "/api/deps":
+            self._send(200, {"deps": detect_deps(data.get("code", ""))})
+        elif self.path == "/api/deps/install":
+            self._send(200, install_deps(data.get("deps", [])))
         elif self.path == "/api/polish":
             convo = data.get("messages", [])
             self._send(200, polish_round(data.get("code", ""), convo, data.get("provider")))

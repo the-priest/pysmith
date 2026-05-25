@@ -211,6 +211,37 @@
     font-family:var(--mono);font-size:11.5px;color:var(--lime);white-space:pre-wrap;word-break:break-all;margin:0}
   .gh-code .btn{position:absolute;top:6px;right:6px;padding:3px 9px;font-size:11px}
   .mono{font-family:var(--mono);color:var(--steel);font-size:12px}
+  /* library slide-in */
+  .library{position:absolute;top:0;right:0;width:300px;height:100%;background:var(--panel);
+    border-left:1px solid var(--line);transform:translateX(100%);transition:transform .22s;z-index:8;
+    display:flex;flex-direction:column;box-shadow:-12px 0 30px rgba(0,0,0,.3)}
+  .library.on{transform:translateX(0)}
+  .lib-h{padding:12px 14px;display:flex;justify-content:space-between;align-items:center;
+    border-bottom:1px solid var(--line);font-family:var(--mono);font-size:11px;letter-spacing:.12em;
+    text-transform:uppercase;color:var(--dim)}
+  .lib-x{cursor:pointer}.lib-x:hover{color:var(--red)}
+  .lib-body{flex:1;overflow:auto;padding:8px}
+  .lib-empty{color:var(--faint);padding:20px;text-align:center;font-size:12px}
+  .lib-item{background:var(--bg);border:1px solid var(--line);border-radius:9px;padding:10px;margin-bottom:8px;cursor:pointer;transition:.12s}
+  .lib-item:hover{border-color:var(--amber)}
+  .lib-item .nm{font-weight:600;font-size:13px;color:var(--ink)}
+  .lib-item .meta{font-family:var(--mono);font-size:10px;color:var(--faint);margin-top:3px}
+  .lib-item .row{display:flex;justify-content:space-between;align-items:center;margin-top:6px}
+  .lib-item .open{font-size:11px;color:var(--amber)}
+  .lib-item .del{font-size:11px;color:var(--faint);cursor:pointer}
+  .lib-item .del:hover{color:var(--red)}
+  /* edit bar + editable textarea */
+  .editbar{display:flex;align-items:center;gap:8px;padding:8px 16px;border-top:1px solid var(--line2);background:var(--bg2)}
+  .editbar .spacer{flex:1}
+  textarea.codeedit{width:100%;height:100%;border:none;background:var(--bg);color:var(--ink);
+    font-family:var(--mono);font-size:12.5px;line-height:1.62;padding:14px 16px;resize:none;outline:none;tab-size:4}
+  /* diff */
+  .diffline{display:block;white-space:pre;padding-left:18px;font-family:var(--mono);font-size:12.5px;line-height:1.55}
+  .diffline.add{background:rgba(159,224,74,.12);color:var(--lime)}
+  .diffline.del{background:rgba(224,89,74,.12);color:var(--red)}
+  .diffline.ctx{color:var(--dim)}
+  .diff-h{padding:8px 16px;font-family:var(--mono);font-size:11px;color:var(--amber);border-bottom:1px solid var(--line2);background:var(--bg2);display:flex;justify-content:space-between}
+  .diff-h .x{cursor:pointer;color:var(--faint)}.diff-h .x:hover{color:var(--ink)}
 
   ::-webkit-scrollbar{width:10px;height:10px}
   ::-webkit-scrollbar-thumb{background:#2a3237;border-radius:5px}
@@ -239,6 +270,7 @@
     <div class="spacer"></div>
     <select id="providerPick" class="provider-pick" title="Which model builds your tools"></select>
     <div class="model-pill"><span class="dot" id="modelDot"></span><span id="modelName">connecting…</span></div>
+    <button class="icon-btn" id="libBtn" title="Tool library">▤</button>
     <button class="icon-btn" id="settingsBtn" title="Settings">⚙</button>
   </div>
 
@@ -270,7 +302,11 @@
           <span class="label">tool</span>
           <span class="fname" id="codeFile">no draft yet</span>
           <div class="acts">
+            <button class="btn ghost" id="diffBtn" disabled title="Show what changed in the last version">⇄ diff</button>
+            <button class="btn ghost" id="editBtn" disabled title="Edit the code yourself">✎ edit</button>
+            <button class="btn ghost" id="depsBtn" disabled title="Detect &amp; install third-party packages">⬇ deps</button>
             <button class="btn ghost" id="copyBtn" disabled>⧉ copy</button>
+            <button class="btn ghost" id="libSaveBtn" disabled title="Save to library">★ library</button>
             <button class="btn release" id="releaseBtn" disabled>◆ get ready for GitHub</button>
             <button class="btn" id="saveBtn" disabled>⤓ save</button>
           </div>
@@ -283,6 +319,18 @@
             <div class="steps"><span>1 · agree</span><span>2 · test</span><span>3 · iterate</span><span>4 · release</span></div>
           </div>
         </div>
+        <div class="editbar" id="editBar" style="display:none">
+          <span class="hint">editing — changes apply on save</span>
+          <span class="spacer"></span>
+          <button class="btn ghost" id="editCancel">cancel</button>
+          <button class="btn" id="editSave">save edits</button>
+        </div>
+      </div>
+
+      <!-- library slide-in -->
+      <div class="library" id="libPanel">
+        <div class="lib-h"><span>Tool library</span><span class="lib-x" id="libClose">✕</span></div>
+        <div class="lib-body" id="libBody"><div class="lib-empty">No saved tools yet.</div></div>
       </div>
 
       <div class="testwrap">
@@ -393,6 +441,7 @@ let state = {
   pendingRelease: false,
   intakeDone: false,
   intakeAnswers: {},
+  prevCode: null,
 };
 
 // ---------- boot ----------
@@ -603,12 +652,15 @@ function splitReply(reply){
 
 // ---------- code pane ----------
 function loadCode(code){
+  state.prevCode = state.code;   // remember the version we're replacing, for diff
   state.code = code;
   guessName(code);
   $("#codeFile").textContent = state.name + ".py";
   $("#fileName").textContent = state.name + ".py";
   renderCode(code);
-  ["copyBtn","saveBtn","runBtn","releaseBtn","fixLogBtn","polishBtn","dlLogBtn","clearLogBtn"].forEach(id=>$("#"+id).disabled=false);
+  ["copyBtn","saveBtn","runBtn","releaseBtn","fixLogBtn","polishBtn","dlLogBtn","clearLogBtn",
+   "editBtn","depsBtn","libSaveBtn"].forEach(id=>$("#"+id).disabled=false);
+  $("#diffBtn").disabled = !state.prevCode;
 }
 function guessName(code){
   // prefer an argparse prog or a obvious function/class, else keep
@@ -637,6 +689,122 @@ function setVersion(v){
 
 $("#copyBtn").onclick = ()=>{ navigator.clipboard.writeText(state.code||""); toast("Copied to clipboard"); };
 $("#saveBtn").onclick = save;
+
+// ---------- diff view ----------
+$("#diffBtn").onclick = ()=>{
+  if(!state.prevCode || !state.code) return;
+  renderDiff(state.prevCode, state.code);
+};
+function renderDiff(a, b){
+  // simple LCS-free line diff: good enough to spot adds/removes
+  const A=a.split("\n"), B=b.split("\n");
+  const setB=new Set(B), setA=new Set(A);
+  const body=$("#codeBody");
+  let html=`<div class="diff-h"><span>diff — previous → current</span><span class="x" id="diffClose">✕ back to code</span></div><pre class="code">`;
+  // walk B showing additions, then list removals
+  B.forEach(line=>{
+    const cls = setA.has(line) ? "ctx" : "add";
+    html += `<span class="diffline ${cls}">${cls==="add"?"+ ":"  "}${escapeHtml(line)||" "}</span>`;
+  });
+  const removed = A.filter(l=>!setB.has(l));
+  if(removed.length){
+    html += `<span class="diffline ctx">  </span>`;
+    removed.forEach(line=> html += `<span class="diffline del">- ${escapeHtml(line)||" "}</span>`);
+  }
+  html += `</pre>`;
+  body.innerHTML = html;
+  $("#diffClose").onclick = ()=>renderCode(state.code);
+}
+
+// ---------- editable code pane ----------
+$("#editBtn").onclick = ()=>{
+  if(!state.code) return;
+  const body=$("#codeBody");
+  body.innerHTML = `<textarea class="codeedit" id="codeEdit" spellcheck="false"></textarea>`;
+  $("#codeEdit").value = state.code;
+  $("#editBar").style.display = "flex";
+  $("#codeEdit").focus();
+};
+$("#editCancel").onclick = ()=>{ $("#editBar").style.display="none"; renderCode(state.code); };
+$("#editSave").onclick = ()=>{
+  const v = $("#codeEdit").value;
+  state.prevCode = state.code; state.code = v;
+  $("#editBar").style.display="none";
+  renderCode(v);
+  $("#diffBtn").disabled = false;
+  // record the manual edit in the conversation so the model stays in sync
+  state.messages.push({role:"assistant", content:"```python\n"+v+"\n```"});
+  state.messages.push({role:"user", content:"(I manually edited the code above — treat that as the current version.)"});
+  toast("Edits applied — model is in sync");
+};
+
+// ---------- deps detect & install ----------
+$("#depsBtn").onclick = async ()=>{
+  if(!state.code) return;
+  let d;
+  try{ d = await fetch("/api/deps",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({code:state.code})}).then(r=>r.json()); }
+  catch(e){ toast("Couldn't reach the local server", true); return; }
+  if(!d.deps || !d.deps.length){ toast("Pure stdlib — no packages needed"); return; }
+  if(!confirm(`This tool needs: ${d.deps.join(", ")}\n\nInstall them into pysmith's managed venv now?`)) return;
+  toast("Installing " + d.deps.join(", ") + "…");
+  let r;
+  try{ r = await fetch("/api/deps/install",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({deps:d.deps})}).then(r=>r.json()); }
+  catch(e){ toast("Install failed to reach server", true); return; }
+  if(r.ok){ toast("Installed — the tool can now use those packages"); addMsg("smith","Installed into the managed venv: "+d.deps.join(", ")+". Runs will use it automatically."); }
+  else { addMsg("smith","⚠ Install had trouble:\n"+(r.log||"unknown")); }
+};
+
+// ---------- library ----------
+$("#libSaveBtn").onclick = async ()=>{
+  if(!state.code) return;
+  let r;
+  try{ r = await fetch("/api/library/save",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({name:state.name, code:state.code, messages:state.messages})}).then(r=>r.json()); }
+  catch(e){ toast("Couldn't reach the local server", true); return; }
+  toast(`Saved "${state.name}" to library`);
+};
+$("#libBtn").onclick = openLibrary;
+$("#libClose").onclick = ()=>$("#libPanel").classList.remove("on");
+async function openLibrary(){
+  $("#libPanel").classList.add("on");
+  let r;
+  try{ r = await fetch("/api/library").then(r=>r.json()); }
+  catch(e){ $("#libBody").innerHTML='<div class="lib-empty">Server offline.</div>'; return; }
+  const tools = r.tools||[];
+  if(!tools.length){ $("#libBody").innerHTML='<div class="lib-empty">No saved tools yet.<br>Build one, then ★ library.</div>'; return; }
+  $("#libBody").innerHTML = tools.map(t=>`
+    <div class="lib-item" data-id="${t.id}">
+      <div class="nm">${escapeHtml(t.name)}</div>
+      <div class="meta">${t.lines} lines · saved ${escapeHtml(t.saved||"")}</div>
+      <div class="row"><span class="open">open ▸</span><span class="del" data-id="${t.id}">delete</span></div>
+    </div>`).join("");
+  $("#libBody").querySelectorAll(".lib-item").forEach(el=>{
+    el.querySelector(".open").onclick = ()=>loadFromLibrary(el.dataset.id);
+    el.onclick = (e)=>{ if(!e.target.classList.contains("del")) loadFromLibrary(el.dataset.id); };
+    el.querySelector(".del").onclick = async (e)=>{
+      e.stopPropagation();
+      await fetch("/api/library/delete",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id:el.dataset.id})});
+      openLibrary();
+    };
+  });
+}
+async function loadFromLibrary(id){
+  let r;
+  try{ r = await fetch("/api/library/load",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id})}).then(r=>r.json()); }
+  catch(e){ toast("Couldn't load", true); return; }
+  if(r.error){ toast("Couldn't load: "+r.error, true); return; }
+  const tool = r.tool;
+  // reset to a clean slate, then hydrate from the saved tool
+  state.messages = tool.messages || [];
+  state.name = tool.id; state.intakeDone = true; state.prevCode = null;
+  $("#thread").innerHTML="";
+  addMsg("smith", `Loaded "${tool.name}" from the library — its build conversation is restored, so we can keep iterating where you left off.`);
+  loadCode(tool.code);
+  setVersion("testing");
+  $("#libPanel").classList.remove("on");
+}
 $("#releaseBtn").onclick = ()=>{ if(state.code) openGithub(); };
 
 function openGithub(){
@@ -896,7 +1064,9 @@ $("#newBtn").onclick = ()=>{
   $("#thread").innerHTML=""; $("#codeFile").textContent="no draft yet"; $("#fileName").textContent="untitled.py";
   $("#codeBody").innerHTML = `<div class="empty"><img src="/assets/icon.svg" alt=""><h2>Nothing on the anvil yet</h2><p>Describe a tool on the left to begin.</p></div>`;
   $("#console").innerHTML = `<span class="placeholder">Run output appears here.</span>`;
-  ["copyBtn","saveBtn","runBtn","releaseBtn","fixLogBtn","polishBtn","dlLogBtn","clearLogBtn"].forEach(id=>$("#"+id).disabled=true);
+  state.prevCode=null;
+  ["copyBtn","saveBtn","runBtn","releaseBtn","fixLogBtn","polishBtn","dlLogBtn","clearLogBtn",
+   "editBtn","diffBtn","depsBtn","libSaveBtn"].forEach(id=>$("#"+id).disabled=true);
   greet();
 };
 
