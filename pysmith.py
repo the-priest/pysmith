@@ -27,13 +27,14 @@ import time
 import shlex
 import socket
 import tempfile
+import threading
 import webbrowser
 import subprocess
 import urllib.request
 import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-__version__ = "6.0.0"
+__version__ = "7.0.0"
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 # ==========================================================================
@@ -948,6 +949,10 @@ class Handler(BaseHTTPRequestHandler):
                                           data.get("kind", "testing")))
             except Exception as e:
                 self._send(200, {"error": str(e)})
+        elif self.path == "/api/quit":
+            self._send(200, {"ok": True})
+            # shut the server down shortly after responding
+            threading.Thread(target=lambda: (time.sleep(0.3), os._exit(0)), daemon=True).start()
         else:
             self._send(404, {"error": "not found"})
 
@@ -957,6 +962,34 @@ def free_port(host, start):
             if s.connect_ex((host, p)) != 0:
                 return p
     return start
+
+def launch_app_window(url):
+    """Open pysmith in a Chromium-family app window (no browser chrome).
+    Falls back to a normal browser tab if no Chromium-family browser is found."""
+    import shutil as _sh
+    # common chromium-family binaries on Linux/Kali
+    candidates = ["chromium", "chromium-browser", "google-chrome", "google-chrome-stable",
+                  "brave-browser", "microsoft-edge", "vivaldi"]
+    app_data = os.path.join(os.path.expanduser("~"), ".local", "share", "pysmith", "window")
+    for browser in candidates:
+        path = _sh.which(browser)
+        if path:
+            try:
+                subprocess.Popen(
+                    [path, f"--app={url}",
+                     f"--user-data-dir={app_data}",   # isolated profile = clean window
+                     "--no-first-run", "--no-default-browser-check",
+                     "--window-size=1280,860"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return browser
+            except Exception:
+                continue
+    # fallback: ordinary browser tab
+    try:
+        webbrowser.open(url)
+    except Exception:
+        pass
+    return None
 
 def main():
     port = free_port(HOST, PORT)
@@ -971,10 +1004,12 @@ def main():
     print(f"  active provider: {PROVIDERS[STATE['provider']]['label']}")
     print(f"  auto-test: up to {AUTOTEST_MAX_ROUNDS} silent fix rounds")
     print(f"  serving local-only. ctrl-c to stop.\n")
-    try:
-        webbrowser.open(url)
-    except Exception:
-        pass
+    used = launch_app_window(url)
+    if used:
+        print(f"  opened in app window via {used}")
+    else:
+        print(f"  no Chromium-family browser found \u2014 opened a normal tab\n"
+              f"  (install chromium for the clean app window)")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

@@ -27,11 +27,37 @@
       radial-gradient(700px 360px at 50% -10%, rgba(70,90,100,.08), transparent 60%),
       var(--bg);
   }
-  body::before{content:"";position:fixed;inset:0;pointer-events:none;opacity:.5;
+  body::before{content:"";position:fixed;inset:0;pointer-events:none;opacity:.5;z-index:0;
     background-image:linear-gradient(rgba(255,255,255,.014) 1px,transparent 1px),
       linear-gradient(90deg,rgba(255,255,255,.014) 1px,transparent 1px);
     background-size:30px 30px;}
-  .app{display:grid;grid-template-rows:54px 1fr;height:100vh}
+  .app{display:grid;grid-template-rows:34px 54px 1fr;height:100vh;position:relative;z-index:1}
+
+  /* animated hacker background */
+  .bg-fx{position:fixed;inset:0;z-index:0;overflow:hidden;pointer-events:none}
+  .bg-dragon{position:absolute;top:50%;left:50%;width:min(120vh,120vw);height:min(120vh,120vw);
+    transform:translate(-50%,-50%);opacity:.10;animation:breathe 14s ease-in-out infinite}
+  @keyframes breathe{0%,100%{opacity:.07;transform:translate(-50%,-50%) scale(1)}
+    50%{opacity:.13;transform:translate(-50%,-50%) scale(1.03)}}
+  .bg-scan{position:absolute;inset:0;background:repeating-linear-gradient(
+    0deg,transparent 0 3px,rgba(0,0,0,.18) 3px 4px);mix-blend-mode:multiply;opacity:.5}
+
+  /* titlebar */
+  .titlebar{display:flex;align-items:center;gap:12px;padding:0 12px;
+    background:linear-gradient(180deg,#0f1416,#0a0d0e);border-bottom:1px solid var(--line);
+    user-select:none;position:relative;z-index:6}
+  .tb-traffic{display:flex;gap:8px}
+  .tl{width:12px;height:12px;border-radius:50%;cursor:pointer;border:1px solid #0006;transition:.12s}
+  .tl-close{background:#e0594a}.tl-close:hover{filter:brightness(1.25);box-shadow:0 0 8px #e0594a}
+  .tl-min{background:#e8a33d}.tl-min:hover{filter:brightness(1.25)}
+  .tl-max{background:#3a4248;cursor:default}
+  .tb-title{flex:1;text-align:center;font-family:var(--mono);font-size:11px;letter-spacing:.18em;
+    color:var(--dim);text-transform:lowercase}
+  .tb-title .tb-glyph{color:var(--amber)}
+  .tb-title .tb-sub{color:var(--faint)}
+  .tb-right{width:60px;text-align:right}
+  .tb-status{color:var(--lime);font-size:9px;animation:pulse 2.4s infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
 
   /* ---------- top bar ---------- */
   .top{display:flex;align-items:center;gap:14px;padding:0 16px;
@@ -255,7 +281,52 @@
 </style>
 </head>
 <body>
+<div class="bg-fx" aria-hidden="true">
+  <svg class="bg-dragon" viewBox="0 0 600 600" preserveAspectRatio="xMidYMid slice">
+    <defs>
+      <radialGradient id="bgglow" cx="50%" cy="48%" r="55%">
+        <stop offset="0%" stop-color="#1a1207" stop-opacity="0.9"/>
+        <stop offset="100%" stop-color="#0a0c0d" stop-opacity="0"/>
+      </radialGradient>
+    </defs>
+    <rect width="600" height="600" fill="url(#bgglow)"/>
+    <!-- original angular dragon-head sigil (not Kali's logo) -->
+    <g fill="none" stroke="#e8a33d" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" opacity="0.55">
+      <!-- head + snout -->
+      <path d="M210 250 L290 215 L355 230 L395 205 L380 245 L405 255 L368 272 L300 300 Z"/>
+      <!-- lower jaw -->
+      <path d="M300 300 L360 300 L392 282"/>
+      <!-- horns sweeping back -->
+      <path d="M290 215 Q250 175 200 180 M300 222 Q270 195 235 200"/>
+      <!-- eye -->
+      <circle cx="330" cy="248" r="5.5" fill="#e8a33d" stroke="none"/>
+      <!-- neck spines -->
+      <path d="M210 250 L175 268 M232 268 L205 295 M255 285 L235 320"/>
+      <!-- wisp of breath from the snout -->
+      <path d="M405 255 q34 -4 50 -28 q18 -22 6 -44" stroke="#e07a3a" opacity="0.8"/>
+    </g>
+    <!-- circuit corners -->
+    <g stroke="#46c7d4" stroke-width="1" opacity="0.16">
+      <path d="M60 60 h120 v40 M540 540 h-120 v-40 M60 540 v-100 h60 M540 60 v100 h-60"/>
+      <circle cx="180" cy="100" r="3" fill="#46c7d4" stroke="none"/>
+      <circle cx="420" cy="500" r="3" fill="#46c7d4" stroke="none"/>
+    </g>
+  </svg>
+  <div class="bg-scan"></div>
+</div>
+
 <div class="app">
+  <!-- window titlebar -->
+  <div class="titlebar" id="titlebar">
+    <div class="tb-traffic">
+      <span class="tl tl-close" id="winClose" title="Quit pysmith"></span>
+      <span class="tl tl-min" id="winMin" title="Minimize"></span>
+      <span class="tl tl-max"></span>
+    </div>
+    <div class="tb-title"><span class="tb-glyph">⚒</span> pysmith <span class="tb-sub">— ai toolsmith</span></div>
+    <div class="tb-right"><span id="tbStatus" class="tb-status">●</span></div>
+  </div>
+
 
   <!-- top bar -->
   <div class="top">
@@ -444,6 +515,19 @@ let state = {
   intakeDone: false,
   intakeAnswers: {},
   prevCode: null,
+};
+
+// ---------- window controls ----------
+$("#winClose").onclick = async ()=>{
+  if(!confirm("Quit pysmith? This stops the local server.")) return;
+  try{ await fetch("/api/quit",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"}); }catch(e){}
+  // in app-mode the window closes when the server dies; also try to close the window
+  try{ window.close(); }catch(e){}
+  document.body.innerHTML = '<div style="height:100vh;display:flex;align-items:center;justify-content:center;color:#8a9398;font-family:monospace">forge banked. you can close this window.</div>';
+};
+$("#winMin").onclick = ()=>{
+  // can't truly minimize a browser window from JS; blur is the closest honest action
+  toast("Minimize is handled by your window manager — use its controls");
 };
 
 // ---------- boot ----------
