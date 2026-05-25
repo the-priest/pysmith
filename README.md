@@ -58,6 +58,18 @@ python3 pysmith.py
 
 ## How it works
 
+When you describe a new tool, pysmith first runs a **structured intake** — the model
+generates a short set of tap-to-answer questions tailored to *that* tool (scan type, output
+format, dependencies, etc.), then builds precisely to your choices. A stronger engineering
+system prompt plus the auto-test loop means even smaller models produce working, defensive code.
+
+When you click **◆ Get ready for GitHub**, pysmith asks your username, repo name, branch,
+and license, then polishes the code and assembles a complete repo: a README with a one-line
+HTTPS install/update command, `install.sh`, `LICENSE`, `.gitignore`, and the exact `git` push
+commands (HTTPS, never SSH).
+
+### The workspace
+
 It's a workspace, built around the **code and testing it** — not a wall of chat.
 
 - **Build dialogue** (left): describe the tool. pysmith agrees on scope first — it'll ask a

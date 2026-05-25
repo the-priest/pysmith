@@ -33,7 +33,7 @@ import urllib.request
 import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-__version__ = "2.0.0"
+__version__ = "4.0.0"
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 # ==========================================================================
@@ -92,40 +92,86 @@ PORT = 8765
 # This is the heart of it: the model is taught to build tools the way a careful
 # senior engineer does -- agree first, testing version by default, release only
 # on request. Tune it to taste.
-SYSTEM_PROMPT = """You are pysmith, an expert Python tool-builder working alongside a security /
-sysadmin user on Kali Linux. You build small, sharp command-line tools in a back-and-forth
-"build dialogue". Follow this method exactly:
+SYSTEM_PROMPT = """You are pysmith, a senior Python engineer who builds small, sharp, genuinely
+working command-line tools for a security / sysadmin user on Kali Linux. You write the kind of
+code a careful professional ships: correct, defensive, readable. Hold yourself to that bar
+regardless of how the request is phrased.
 
-1. AGREE FIRST. If the request is vague, over-scoped, or hides a real decision, do NOT dump
-   code. Ask one or two pointed questions, or state your assumptions and lay out a short plan:
-   what it will do, its inputs and outputs, and any external binaries it wraps. Be honest about
-   scope -- if something is infeasible or a bad idea, say so plainly and offer the realistic
-   version. Only build once the shape is agreed.
+ENGINEERING STANDARDS (apply to every script you write):
+- Correctness first. The code must actually run and do what was agreed. Mentally trace the
+  happy path AND the obvious failure paths before you output.
+- Validate inputs. Check args, file existence, ranges, formats. Never assume input is well-formed.
+- Fail gracefully and informatively: catch the exceptions that will realistically occur
+  (network timeouts, missing files, permission denied, malformed data, missing binaries),
+  print a clear message to stderr, and exit with a non-zero code. Never let a bare traceback
+  be the user experience for an expected error.
+- Wrap external binaries (nmap, hashcat, tcpdump, etc.) with subprocess; detect when the binary
+  is absent and tell the user exactly what to install.
+- No silent failure, no bare `except: pass`. No placeholder/stub functions presented as working.
+  No invented library APIs — if unsure a function exists, use a standard approach you are sure of.
+- Concurrency/timeouts where it matters (e.g. scanning many hosts) so the tool isn't unusably slow,
+  but keep it correct over clever.
+- Prefer the standard library. If a third-party package is genuinely needed, put the exact
+  `pip install X` line on ONE line BEFORE the code block.
 
-2. TESTING VERSION BY DEFAULT. When you write code, produce a TESTING version: ONE complete,
-   runnable, single-file Python script that genuinely works and is easy to try right now.
-   Favour correctness and fast iteration over ceremony. Include just enough error handling to
-   fail gracefully. Prefer the standard library; if a third-party package is truly required,
-   state the exact `pip install ...` line on one line BEFORE the code block. If the tool wraps
-   a binary (nmap, hashcat, ...), call it via subprocess and handle it being missing. Do NOT
-   add heavy argparse scaffolding or packaging yet.
+METHOD (the build dialogue):
+1. CLARIFY BEFORE BUILDING. If meaningful details are unresolved, do not dump code — surface the
+   decisions. (pysmith may run a structured intake for you; honour every answer it passes you
+   precisely.) Once the shape is clear, build.
+2. TESTING VERSION BY DEFAULT: ONE complete, runnable, single-file script. Lean but correct —
+   full input validation and error handling, but no packaging ceremony yet.
+3. ITERATE on real feedback: when given a run result/error/log, return the FULL updated script
+   (never a diff) and state briefly what you changed and why.
+4. RELEASE VERSION ONLY WHEN ASKED: top docstring with summary + usage example, clean argparse
+   CLI with --help, robust error handling, sensible exit codes, helpful comments, zero dead code.
+5. SAFETY: no destructive operations (mass deletion, disk wipes, fork bombs) unless the user
+   explicitly and unambiguously asks; if so, call it out. Assume it runs on the user's own machine.
 
-3. ITERATE on real feedback. When the user pastes a run result or error, return the FULL updated
-   script (never a diff) and say briefly what you changed and why.
+OUTPUT FORMAT: a tight message first (a few sentences). THEN, only when actually providing code,
+exactly ONE ```python fenced block with the entire script — never two blocks. When only planning
+or discussing, include no code block at all."""
 
-4. RELEASE VERSION ONLY ON REQUEST. When -- and only when -- the user asks for the release /
-   github / final version, produce the polished form: a top docstring with a one-line summary
-   and a usage example, a clean argparse CLI, solid error handling and sensible exit codes,
-   useful comments, no dead code. After the code block, propose a short plain-text README
-   (what it does, install, usage).
+# Used to generate a tailored, clickable intake for a new tool request.
+INTAKE_PROMPT = """You are the requirements analyst for pysmith, a Python tool builder. The user
+wants to build a tool. Your job is to produce the SHORT, HIGH-VALUE set of questions needed to
+build EXACTLY what they want — no lazy or generic filler.
 
-5. SAFETY. Never include destructive operations (mass deletion, disk wipes, fork bombs) unless
-   the user explicitly and unambiguously asks, and call them out if so. Assume the code runs on
-   the user's own machine.
+Return ONLY a JSON object, no prose, no markdown fences:
+{"summary": "<one line restating what they want to build>",
+ "questions": [
+   {"q": "<clear question>", "options": ["<opt1>", "<opt2>", "<opt3>"], "multi": false},
+   ...
+ ]}
 
-OUTPUT FORMAT: a tight message first (a few sentences at most). THEN, only when you are actually
-providing code, exactly ONE ```python fenced block containing the entire script -- never two.
-When you are only planning or discussing, do not include any code block."""
+Rules:
+- 3 to 6 questions MAX. Only ask what genuinely changes the code.
+- Tailor every question to THIS tool. A port scanner needs scan-type/output-format questions;
+  a log parser needs input-format/filter questions. Do not ask irrelevant things.
+- Always cover, where relevant: inputs (what/format), outputs (stdout/JSON/CSV/file), key
+  behaviour options, whether wrapping an external binary or pure-Python, and any third-party
+  dependency tolerance.
+- 2 to 4 options per question. Options must be concrete and mutually distinct. Set "multi": true
+  only when picking several genuinely makes sense.
+- Prefer options the user can just tap. Keep them short."""
+
+# Used by the GitHub-ready flow to assemble repo files from the user's answers.
+GITHUB_PROMPT = """You are preparing a polished GitHub release of a Python tool. You will be given
+the final code and the user's repo details. Produce a complete, professional repo.
+
+Return ONLY a JSON object, no prose, no markdown fences:
+{"readme": "<full README.md markdown>",
+ "gitignore": "<.gitignore contents>",
+ "requirements": "<requirements.txt contents, or empty string if pure stdlib>",
+ "description": "<one-line repo description>"}
+
+README requirements:
+- Title, one-line description, then a short paragraph on what it does.
+- An "Install" section with a ONE-LINE curl command that downloads and runs install.sh from the
+  user's repo over HTTPS (never ssh). Use the raw.githubusercontent.com URL for their repo/branch.
+  The same line should work for updates (re-running it).
+- A "Usage" section with real, copy-pasteable examples derived from the actual CLI in the code.
+- Requirements, and the license name.
+- Clean, scannable, professional. No fluff."""
 
 DANGER = [
     r"rm\s+-rf\s+/", r":\(\)\s*\{", r"shutil\.rmtree\(\s*['\"]/", r"\bmkfs\b",
@@ -343,6 +389,53 @@ def chat_with_autotest(messages, provider_id=None):
             return res
         res = nxt
 
+def _parse_json_reply(reply):
+    """Extract a JSON object from a model reply, tolerating fences/prose."""
+    reply = re.sub(r"```(?:json)?", "", reply).strip()
+    m = re.search(r"\{.*\}", reply, re.S)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(0))
+    except Exception:
+        return None
+
+def make_intake(request, provider_id=None):
+    """Ask the model for a tailored, clickable question set for a tool request."""
+    res = call_model([{"role": "system", "content": INTAKE_PROMPT},
+                      {"role": "user", "content": request}], provider_id)
+    if res.get("error"):
+        return res
+    parsed = _parse_json_reply(res.get("reply", ""))
+    if not parsed or "questions" not in parsed:
+        # graceful fallback: no intake, just proceed to build
+        return {"intake": None}
+    # sanitise
+    qs = []
+    for q in parsed.get("questions", [])[:6]:
+        opts = [str(o) for o in q.get("options", [])][:4]
+        if q.get("q") and len(opts) >= 2:
+            qs.append({"q": str(q["q"]), "options": opts, "multi": bool(q.get("multi"))})
+    return {"intake": {"summary": parsed.get("summary", ""), "questions": qs}}
+
+def make_github(code, details, provider_id=None):
+    """Generate README/.gitignore/requirements from the final code + repo details."""
+    user = details.get("username", "USER")
+    repo = details.get("repo", "tool")
+    branch = details.get("branch", "main")
+    license_name = details.get("license", "MIT")
+    detail_blob = (f"username: {user}\nrepo: {repo}\nbranch: {branch}\n"
+                   f"license: {license_name}\nclone over HTTPS only (never ssh).\n"
+                   f"raw base: https://raw.githubusercontent.com/{user}/{repo}/{branch}/")
+    res = call_model([{"role": "system", "content": GITHUB_PROMPT},
+                      {"role": "user", "content":
+                       f"Repo details:\n{detail_blob}\n\n=== FINAL CODE ===\n```python\n{code}\n```"}],
+                     provider_id)
+    if res.get("error"):
+        return res
+    parsed = _parse_json_reply(res.get("reply", "")) or {}
+    return {"github": parsed, "details": details}
+
 def run_code(code, args, confirmed):
     danger = looks_dangerous(code)
     if danger and not confirmed:
@@ -413,6 +506,196 @@ def save_tool(code, name, kind):
         except Exception: pass
         return {"path": pyp}
 
+LICENSES = {
+    "MIT": ("MIT License\n\nCopyright (c) {year} {holder}\n\nPermission is hereby granted, "
+            "free of charge, to any person obtaining a copy of this software and associated "
+            "documentation files (the \"Software\"), to deal in the Software without restriction, "
+            "including without limitation the rights to use, copy, modify, merge, publish, "
+            "distribute, sublicense, and/or sell copies of the Software, and to permit persons "
+            "to whom the Software is furnished to do so, subject to the following conditions:\n\n"
+            "The above copyright notice and this permission notice shall be included in all "
+            "copies or substantial portions of the Software.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\", "
+            "WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE "
+            "WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. "
+            "IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES "
+            "OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING "
+            "FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE "
+            "SOFTWARE.\n"),
+}
+
+def _install_sh(user, repo, branch, name):
+    """A smart one-file installer that works via curl|bash or from a clone."""
+    return f"""#!/usr/bin/env bash
+# {repo} installer — one-line install/update over HTTPS:
+#   curl -fsSL https://raw.githubusercontent.com/{user}/{repo}/{branch}/install.sh | bash
+set -euo pipefail
+REPO="{user}/{repo}"; BRANCH="{branch}"
+SRC="$HOME/.local/share/{repo}"; BIN="$HOME/.local/bin"; LAUNCH="$BIN/{name}"
+
+command -v python3 >/dev/null 2>&1 || {{ echo "python3 required: sudo apt install python3"; exit 1; }}
+
+mkdir -p "$SRC" "$BIN"
+SELF_DIR="$( cd "$( dirname "${{BASH_SOURCE[0]:-$0}}" )" 2>/dev/null && pwd || true )"
+if [ -n "$SELF_DIR" ] && [ -f "$SELF_DIR/{name}.py" ]; then
+  cp -f "$SELF_DIR/{name}.py" "$SRC/"
+  [ -f "$SELF_DIR/requirements.txt" ] && cp -f "$SELF_DIR/requirements.txt" "$SRC/" || true
+else
+  if command -v git >/dev/null 2>&1; then
+    if [ -d "$SRC/.git" ]; then git -C "$SRC" pull --ff-only --quiet || true
+    else rm -rf "$SRC"; git clone --depth 1 -b "$BRANCH" "https://github.com/$REPO.git" "$SRC" --quiet; fi
+  else
+    TARBALL="https://codeload.github.com/$REPO/tar.gz/refs/heads/$BRANCH"
+    if command -v curl >/dev/null 2>&1; then curl -fsSL "$TARBALL" | tar xz -C "$SRC" --strip-components=1
+    elif command -v wget >/dev/null 2>&1; then wget -qO- "$TARBALL" | tar xz -C "$SRC" --strip-components=1
+    else echo "need git, curl, or wget"; exit 1; fi
+  fi
+fi
+
+# install python deps if any
+[ -f "$SRC/requirements.txt" ] && python3 -m pip install -r "$SRC/requirements.txt" --break-system-packages -q 2>/dev/null || true
+
+cat > "$LAUNCH" <<EOF
+#!/usr/bin/env bash
+exec python3 "$SRC/{name}.py" "\\$@"
+EOF
+chmod +x "$LAUNCH"
+
+case ":$PATH:" in *":$BIN:"*) ;; *)
+  RC="$HOME/.bashrc"; [ -n "${{ZSH_VERSION:-}}" ] && RC="$HOME/.zshrc"
+  echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$RC"
+  echo "added $BIN to PATH in $RC — run: source $RC" ;;
+esac
+echo "installed. run: {name}"
+"""
+
+def write_github_repo(code, name, gh, details):
+    """Write a complete polished repo into ./github/<repo>/."""
+    name = re.sub(r"[^A-Za-z0-9_\-]", "_", (name or "tool")).strip("_") or "tool"
+    user = details.get("username", "USER")
+    repo = re.sub(r"[^A-Za-z0-9_.\-]", "-", details.get("repo", name)) or name
+    branch = details.get("branch", "main")
+    license_name = details.get("license", "MIT")
+    holder = details.get("holder", user)
+
+    d = os.path.join(os.getcwd(), "github", repo)
+    os.makedirs(d, exist_ok=True)
+
+    # main script
+    with open(os.path.join(d, name + ".py"), "w") as f:
+        f.write(code + "\n")
+    try: os.chmod(os.path.join(d, name + ".py"), 0o755)
+    except Exception: pass
+
+    # README (AI-generated, with fallback)
+    readme = gh.get("readme") or (
+        f"# {repo}\n\n{gh.get('description','A Python tool built with pysmith.')}\n\n"
+        f"## Install\n\n```bash\ncurl -fsSL https://raw.githubusercontent.com/{user}/{repo}/{branch}/install.sh | bash\n```\n\n"
+        f"## Usage\n\n```bash\n{name} --help\n```\n")
+    with open(os.path.join(d, "README.md"), "w") as f:
+        f.write(readme)
+
+    # .gitignore
+    with open(os.path.join(d, ".gitignore"), "w") as f:
+        f.write(gh.get("gitignore") or "__pycache__/\n*.py[cod]\n.venv/\nvenv/\n.env\n*.key\n.DS_Store\n")
+
+    # requirements (only if non-empty)
+    reqs = (gh.get("requirements") or "").strip()
+    if reqs:
+        with open(os.path.join(d, "requirements.txt"), "w") as f:
+            f.write(reqs + "\n")
+
+    # install.sh
+    ish = os.path.join(d, "install.sh")
+    with open(ish, "w") as f:
+        f.write(_install_sh(user, repo, branch, name))
+    try: os.chmod(ish, 0o755)
+    except Exception: pass
+
+    # LICENSE
+    lic = LICENSES.get(license_name)
+    if lic:
+        with open(os.path.join(d, "LICENSE"), "w") as f:
+            f.write(lic.format(year=time.strftime("%Y"), holder=holder))
+
+    # the exact push commands, HTTPS only
+    push = [
+        "cd " + repo,
+        "git init",
+        "git add .",
+        f'git commit -m "{repo} — initial release"',
+        f"git branch -M {branch}",
+        f"git remote add origin https://github.com/{user}/{repo}.git",
+        f"git push -u origin {branch}",
+    ]
+    return {"path": d, "files": sorted(os.listdir(d)), "push": push,
+            "install_line": f"curl -fsSL https://raw.githubusercontent.com/{user}/{repo}/{branch}/install.sh | bash"}
+
+# --------------------------------------------------------------------------
+# SESSION LOG  -- every run is appended; one button hands it all to the model
+# --------------------------------------------------------------------------
+SESSION_LOG = []   # list of dicts: {ts, kind, name, args, exit, seconds, stdout, stderr}
+
+def log_run(name, args, result):
+    SESSION_LOG.append({
+        "ts": time.strftime("%H:%M:%S"),
+        "name": name, "args": args,
+        "exit": result.get("exit"), "seconds": result.get("seconds"),
+        "stdout": result.get("stdout", ""), "stderr": result.get("stderr", ""),
+    })
+    # keep it bounded so we never blow the context window
+    if len(SESSION_LOG) > 40:
+        del SESSION_LOG[0:len(SESSION_LOG) - 40]
+
+def render_log(full=True):
+    """Render the session log as a single text blob (also what gets saved to file)."""
+    lines = [f"pysmith session log — {len(SESSION_LOG)} run(s)", "=" * 50]
+    for i, e in enumerate(SESSION_LOG, 1):
+        lines.append(f"\n[run {i}] {e['ts']}  {e['name']}.py {e['args']}".rstrip())
+        lines.append(f"exit {e['exit']} · {e['seconds']}s")
+        if e["stdout"]:
+            out = e["stdout"] if full else e["stdout"][-1500:]
+            lines.append("--- stdout ---\n" + out.rstrip())
+        if e["stderr"]:
+            lines.append("--- stderr ---\n" + e["stderr"].rstrip())
+    return "\n".join(lines)
+
+def fix_from_log(code, messages, provider_id=None):
+    """Send the current code + the whole session log to the model for a fix."""
+    if not SESSION_LOG:
+        return {"error": "No runs logged yet — run the tool at least once first."}
+    log_blob = render_log(full=False)
+    convo = [m for m in messages if m.get("role") != "system"]
+    convo = [{"role": "system", "content": SYSTEM_PROMPT}] + convo + [{
+        "role": "user",
+        "content": (
+            "Here is the current tool and the full log of how it behaved when I ran it. "
+            "Diagnose every problem you can see in the runs and return the FULL corrected "
+            "script. Briefly list what you fixed.\n\n"
+            f"=== CURRENT CODE ===\n```python\n{code}\n```\n\n"
+            f"=== RUN LOG ===\n{log_blob}"
+        )
+    }]
+    return chat_with_autotest(convo, provider_id)
+
+def polish_round(code, messages, provider_id=None):
+    """One iteration of the auto-polish loop: run a quick smoke, then ask the model
+    to make the tool more robust/polished, returning improved code."""
+    # smoke the current code so we can tell the model what's wrong right now
+    passed, report, _ = smoke_test(code)
+    state_note = "It passes a basic smoke test." if passed else f"It currently FAILS a check:\n{report}"
+    log_blob = render_log(full=False) if SESSION_LOG else "(no runs yet)"
+    convo = [{"role": "system", "content": SYSTEM_PROMPT}, {
+        "role": "user",
+        "content": (
+            "Improve this tool by one meaningful increment: fix any bug, harden error "
+            "handling, improve output clarity, and add the single most valuable missing "
+            "feature — but keep it ONE self-contained script and don't over-engineer. "
+            "Return the FULL improved script and one line on what you changed.\n\n"
+            f"{state_note}\n\n=== CODE ===\n```python\n{code}\n```\n\n=== RECENT RUNS ===\n{log_blob}"
+        )
+    }]
+    return chat_with_autotest(convo, provider_id)
+
 # ==========================================================================
 # http
 # ==========================================================================
@@ -460,6 +743,16 @@ class Handler(BaseHTTPRequestHandler):
                 "autotest": AUTOTEST_MAX_ROUNDS,
                 "version": __version__,
             })
+        elif self.path == "/api/log":
+            self._send(200, {"log": render_log(full=True), "runs": len(SESSION_LOG)})
+        elif self.path == "/api/log.txt":
+            blob = render_log(full=True).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Disposition", "attachment; filename=pysmith-session.log")
+            self.send_header("Content-Length", str(len(blob)))
+            self.end_headers()
+            self.wfile.write(blob)
         else:
             self._send(404, {"error": "not found"})
 
@@ -493,8 +786,32 @@ class Handler(BaseHTTPRequestHandler):
             provider = data.get("provider")  # optional per-request override
             self._send(200, chat_with_autotest(messages, provider))
         elif self.path == "/api/run":
-            self._send(200, run_code(data.get("code", ""), data.get("args", ""),
-                                     bool(data.get("confirm"))))
+            result = run_code(data.get("code", ""), data.get("args", ""),
+                              bool(data.get("confirm")))
+            # log only actual runs (not the confirm-gate response)
+            if "needsConfirm" not in result:
+                log_run(data.get("name", "tool"), data.get("args", ""), result)
+            self._send(200, result)
+        elif self.path == "/api/fixlog":
+            convo = data.get("messages", [])
+            self._send(200, fix_from_log(data.get("code", ""), convo, data.get("provider")))
+        elif self.path == "/api/intake":
+            self._send(200, make_intake(data.get("request", ""), data.get("provider")))
+        elif self.path == "/api/github":
+            self._send(200, make_github(data.get("code", ""), data.get("details", {}),
+                                        data.get("provider")))
+        elif self.path == "/api/github/write":
+            try:
+                self._send(200, write_github_repo(data.get("code", ""), data.get("name", "tool"),
+                                                  data.get("github", {}), data.get("details", {})))
+            except Exception as e:
+                self._send(200, {"error": str(e)})
+        elif self.path == "/api/log.clear":
+            SESSION_LOG.clear()
+            self._send(200, {"runs": 0})
+        elif self.path == "/api/polish":
+            convo = data.get("messages", [])
+            self._send(200, polish_round(data.get("code", ""), convo, data.get("provider")))
         elif self.path == "/api/save":
             try:
                 self._send(200, save_tool(data.get("code", ""), data.get("name", "tool"),
