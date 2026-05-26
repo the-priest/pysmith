@@ -57,6 +57,10 @@
   .tb-title .tb-sub{color:var(--faint)}
   .tb-right{width:60px;text-align:right}
   .tb-status{color:var(--lime);font-size:9px;animation:pulse 2.4s infinite}
+  .drop-overlay{position:fixed;inset:0;z-index:40;background:rgba(10,12,13,.82);backdrop-filter:blur(3px);
+    display:flex;align-items:center;justify-content:center;border:3px dashed var(--amber);}
+  .drop-inner{font-family:var(--mono);font-size:18px;color:var(--amber);letter-spacing:.06em;
+    padding:40px 60px;border-radius:16px;background:var(--panel);border:1px solid var(--line)}
   @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
 
   /* ---------- top bar ---------- */
@@ -88,7 +92,7 @@
   .icon-btn:hover{color:var(--ink);border-color:var(--amber)}
 
   /* ---------- main split ---------- */
-  .main{display:grid;grid-template-columns:392px 1fr;min-height:0}
+  .main{display:grid;grid-template-columns:480px 1fr;min-height:0}
 
   /* dialogue column */
   .dialogue{display:flex;flex-direction:column;min-height:0;
@@ -105,7 +109,7 @@
   .msg.you .who{color:var(--cyan)}
   .msg.smith .who{color:var(--amber)}
   .msg .who::before{content:"";width:5px;height:5px;border-radius:50%;background:currentColor}
-  .bubble{font-size:13.5px;line-height:1.55;color:var(--ink);white-space:pre-wrap;word-wrap:break-word}
+  .bubble{font-size:14.5px;line-height:1.62;color:var(--ink);white-space:pre-wrap;word-wrap:break-word}
   .msg.you .bubble{color:var(--steel)}
   .msg.smith .bubble{background:var(--panel);border:1px solid var(--line2);border-left:2px solid var(--amber);
     border-radius:8px;padding:10px 12px}
@@ -245,6 +249,10 @@
   .lib-h{padding:12px 14px;display:flex;justify-content:space-between;align-items:center;
     border-bottom:1px solid var(--line);font-family:var(--mono);font-size:11px;letter-spacing:.12em;
     text-transform:uppercase;color:var(--dim)}
+  .lib-tabs{display:flex;gap:14px}
+  .lib-tab{cursor:pointer;color:var(--faint);padding-bottom:2px;border-bottom:2px solid transparent}
+  .lib-tab:hover{color:var(--dim)}
+  .lib-tab.on{color:var(--amber);border-bottom-color:var(--amber)}
   .lib-x{cursor:pointer}.lib-x:hover{color:var(--red)}
   .lib-body{flex:1;overflow:auto;padding:8px}
   .lib-empty{color:var(--faint);padding:20px;text-align:center;font-size:12px}
@@ -398,10 +406,16 @@
         </div>
       </div>
 
-      <!-- library slide-in -->
+      <!-- library / sessions slide-in -->
       <div class="library" id="libPanel">
-        <div class="lib-h"><span>Tool library</span><span class="lib-x" id="libClose">✕</span></div>
-        <div class="lib-body" id="libBody"><div class="lib-empty">No saved tools yet.</div></div>
+        <div class="lib-h">
+          <div class="lib-tabs">
+            <span class="lib-tab on" id="tabSessions" data-tab="sessions">in progress</span>
+            <span class="lib-tab" id="tabLibrary" data-tab="library">saved tools</span>
+          </div>
+          <span class="lib-x" id="libClose">✕</span>
+        </div>
+        <div class="lib-body" id="libBody"><div class="lib-empty">Nothing yet.</div></div>
       </div>
 
       <div class="testwrap">
@@ -515,9 +529,47 @@ let state = {
   intakeDone: false,
   intakeAnswers: {},
   prevCode: null,
+  sessionId: null,
 };
 
-// ---------- window controls ----------
+// ---------- drag & drop files ----------
+(function(){
+  const work = document.querySelector(".work") || document.body;
+  let overlay;
+  function showOverlay(){
+    if(overlay) return;
+    overlay = document.createElement("div");
+    overlay.className = "drop-overlay";
+    overlay.innerHTML = '<div class="drop-inner">⬇ drop a code file to load it</div>';
+    document.body.appendChild(overlay);
+  }
+  function hideOverlay(){ if(overlay){ overlay.remove(); overlay=null; } }
+  ["dragenter","dragover"].forEach(ev=>window.addEventListener(ev,e=>{
+    if(e.dataTransfer && [...e.dataTransfer.types].includes("Files")){ e.preventDefault(); showOverlay(); }
+  }));
+  ["dragleave","drop"].forEach(ev=>window.addEventListener(ev,e=>{
+    if(ev==="dragleave" && e.relatedTarget) return;
+    hideOverlay();
+  }));
+  window.addEventListener("drop", async e=>{
+    if(!e.dataTransfer || !e.dataTransfer.files.length) return;
+    e.preventDefault(); hideOverlay();
+    const file = e.dataTransfer.files[0];
+    if(file.size > 500000){ toast("File too big (max ~500KB)", true); return; }
+    const text = await file.text();
+    // load it as the current tool, in a fresh context so we can iterate on it
+    state.messages = [{role:"user", content:`I'm dropping in an existing file "${file.name}" to work on:\n\`\`\`python\n${text}\n\`\`\``},
+                      {role:"assistant", content:"Loaded your file. Tell me what to debug, fix, or improve."}];
+    state.name = (file.name.replace(/\.[^.]+$/,"")||"dropped").replace(/[^A-Za-z0-9_\-]/g,"_");
+    state.intakeDone = true; state.prevCode = null;
+    $("#thread").innerHTML="";
+    addMsg("you", `Dropped in: ${file.name} (${text.split(chr10()).length} lines)`);
+    addMsg("smith", "Loaded your file into the workspace — it's ready to run, debug, or improve. Tell me what you want to do with it, or just hit Run to see how it behaves.");
+    loadCode(text); setVersion("testing");
+    toast(`Loaded ${file.name}`);
+  });
+  function chr10(){ return String.fromCharCode(10); }
+})();
 $("#winClose").onclick = async ()=>{
   if(!confirm("Quit pysmith? This stops the local server.")) return;
   try{ await fetch("/api/quit",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"}); }catch(e){}
@@ -747,6 +799,21 @@ function loadCode(code){
   ["copyBtn","saveBtn","runBtn","releaseBtn","fixLogBtn","polishBtn","dlLogBtn","clearLogBtn",
    "editBtn","depsBtn","libSaveBtn"].forEach(id=>$("#"+id).disabled=false);
   $("#diffBtn").disabled = !state.prevCode;
+  autosaveSession();   // a tool exists now → persist the work-in-progress
+}
+
+let _autosaveTimer;
+function autosaveSession(){
+  // debounced: don't hammer disk on every keystroke-level change
+  clearTimeout(_autosaveTimer);
+  _autosaveTimer = setTimeout(async ()=>{
+    if(!state.code) return;
+    try{
+      const r = await fetch("/api/session/save",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({id:state.sessionId, name:state.name, code:state.code, messages:state.messages})}).then(r=>r.json());
+      if(r.id) state.sessionId = r.id;
+    }catch(e){ /* silent — autosave shouldn't nag */ }
+  }, 800);
 }
 function guessName(code){
   // prefer an argparse prog or a obvious function/class, else keep
@@ -851,10 +918,58 @@ $("#libSaveBtn").onclick = async ()=>{
   catch(e){ toast("Couldn't reach the local server", true); return; }
   toast(`Saved "${state.name}" to library`);
 };
-$("#libBtn").onclick = openLibrary;
+$("#libBtn").onclick = ()=>openPanel(state._panelTab||"sessions");
 $("#libClose").onclick = ()=>$("#libPanel").classList.remove("on");
-async function openLibrary(){
+$("#tabSessions").onclick = ()=>openPanel("sessions");
+$("#tabLibrary").onclick = ()=>openPanel("library");
+
+async function openPanel(tab){
+  state._panelTab = tab;
   $("#libPanel").classList.add("on");
+  $("#tabSessions").classList.toggle("on", tab==="sessions");
+  $("#tabLibrary").classList.toggle("on", tab==="library");
+  if(tab==="sessions") renderSessions(); else renderLibrary();
+}
+
+async function renderSessions(){
+  let r;
+  try{ r = await fetch("/api/sessions").then(r=>r.json()); }
+  catch(e){ $("#libBody").innerHTML='<div class="lib-empty">Server offline.</div>'; return; }
+  const ss = r.sessions||[];
+  if(!ss.length){ $("#libBody").innerHTML='<div class="lib-empty">No tools in progress.<br>Start building and it auto-saves here.</div>'; return; }
+  $("#libBody").innerHTML = ss.map(s=>`
+    <div class="lib-item" data-id="${s.id}">
+      <div class="nm">${escapeHtml(s.name)}</div>
+      <div class="meta">${s.turns} turns · ${s.hasCode?"has code":"no code yet"} · ${escapeHtml(s.updated||"")}</div>
+      <div class="row"><span class="open">resume ▸</span><span class="del" data-id="${s.id}">delete</span></div>
+    </div>`).join("");
+  $("#libBody").querySelectorAll(".lib-item").forEach(el=>{
+    el.onclick=(e)=>{ if(!e.target.classList.contains("del")) resumeSession(el.dataset.id); };
+    el.querySelector(".del").onclick=async(e)=>{ e.stopPropagation();
+      await fetch("/api/session/delete",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id:el.dataset.id})});
+      renderSessions(); };
+  });
+}
+async function resumeSession(id){
+  let r;
+  try{ r = await fetch("/api/session/load",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id})}).then(r=>r.json()); }
+  catch(e){ toast("Couldn't load", true); return; }
+  if(r.error){ toast(r.error, true); return; }
+  const s = r.session;
+  state.messages = s.messages||[]; state.name = s.id; state.sessionId = s.id;
+  state.intakeDone = true; state.prevCode = null;
+  $("#thread").innerHTML="";
+  // replay the conversation so it looks like this chat
+  (s.messages||[]).forEach(m=>{
+    if(m.role==="user") addMsg("you", m.content.replace(/```[\s\S]*?```/g,"[code]"));
+    else if(m.role==="assistant"){ const {prose}=splitReply(m.content); if(prose) addMsg("smith", prose); }
+  });
+  if(s.code){ loadCode(s.code); setVersion("testing"); }
+  $("#libPanel").classList.remove("on");
+  toast(`Resumed "${s.name}"`);
+}
+
+async function renderLibrary(){
   let r;
   try{ r = await fetch("/api/library").then(r=>r.json()); }
   catch(e){ $("#libBody").innerHTML='<div class="lib-empty">Server offline.</div>'; return; }
@@ -867,13 +982,11 @@ async function openLibrary(){
       <div class="row"><span class="open">open ▸</span><span class="del" data-id="${t.id}">delete</span></div>
     </div>`).join("");
   $("#libBody").querySelectorAll(".lib-item").forEach(el=>{
-    el.querySelector(".open").onclick = ()=>loadFromLibrary(el.dataset.id);
-    el.onclick = (e)=>{ if(!e.target.classList.contains("del")) loadFromLibrary(el.dataset.id); };
-    el.querySelector(".del").onclick = async (e)=>{
-      e.stopPropagation();
+    el.querySelector(".open").onclick=()=>loadFromLibrary(el.dataset.id);
+    el.onclick=(e)=>{ if(!e.target.classList.contains("del")) loadFromLibrary(el.dataset.id); };
+    el.querySelector(".del").onclick=async(e)=>{ e.stopPropagation();
       await fetch("/api/library/delete",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id:el.dataset.id})});
-      openLibrary();
-    };
+      renderLibrary(); };
   });
 }
 async function loadFromLibrary(id){
@@ -1164,6 +1277,7 @@ $("#newBtn").onclick = ()=>{
   $("#codeBody").innerHTML = `<div class="empty"><img src="/assets/icon.svg" alt=""><h2>Nothing on the anvil yet</h2><p>Describe a tool on the left to begin.</p></div>`;
   $("#console").innerHTML = `<span class="placeholder">Run output appears here.</span>`;
   state.prevCode=null;
+  state.sessionId=null;
   ["copyBtn","saveBtn","runBtn","releaseBtn","fixLogBtn","polishBtn","dlLogBtn","clearLogBtn",
    "editBtn","diffBtn","depsBtn","libSaveBtn"].forEach(id=>$("#"+id).disabled=true);
   greet();

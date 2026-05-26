@@ -34,7 +34,7 @@ import urllib.request
 import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-__version__ = "7.0.0"
+__version__ = "8.0.0"
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 # ==========================================================================
@@ -301,6 +301,54 @@ def library_delete(tid):
         return {"error": str(e)}
 
 # --------------------------------------------------------------------------
+# SESSIONS  -- live works-in-progress (auto-saved as you build), like chats
+# --------------------------------------------------------------------------
+SESSION_DIR = os.path.join(os.path.expanduser("~"), ".local", "share", "pysmith", "sessions")
+
+def session_save(sid, name, code, messages):
+    """Auto-save the live conversation+code for a tool in progress."""
+    os.makedirs(SESSION_DIR, exist_ok=True)
+    sid = sid or time.strftime("s%Y%m%d-%H%M%S")
+    rec = {"id": sid, "name": name or "untitled", "code": code or "",
+           "messages": messages or [], "updated": time.strftime("%Y-%m-%d %H:%M")}
+    with open(os.path.join(SESSION_DIR, _safe_id(sid) + ".json"), "w") as f:
+        json.dump(rec, f)
+    return {"id": sid, "updated": rec["updated"]}
+
+def session_list():
+    if not os.path.isdir(SESSION_DIR):
+        return {"sessions": []}
+    out = []
+    for fn in os.listdir(SESSION_DIR):
+        if not fn.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(SESSION_DIR, fn)) as f:
+                r = json.load(f)
+            msgs = r.get("messages", [])
+            out.append({"id": r.get("id"), "name": r.get("name"),
+                        "updated": r.get("updated"),
+                        "turns": sum(1 for m in msgs if m.get("role") == "user"),
+                        "hasCode": bool(r.get("code"))})
+        except Exception:
+            continue
+    out.sort(key=lambda s: s.get("updated", ""), reverse=True)
+    return {"sessions": out}
+
+def session_load(sid):
+    path = os.path.join(SESSION_DIR, _safe_id(sid) + ".json")
+    if not os.path.exists(path):
+        return {"error": "not found"}
+    with open(path) as f:
+        return {"session": json.load(f)}
+
+def session_delete(sid):
+    try:
+        os.remove(os.path.join(SESSION_DIR, _safe_id(sid) + ".json")); return {"ok": True}
+    except Exception as e:
+        return {"error": str(e)}
+
+# --------------------------------------------------------------------------
 # DEPENDENCIES  -- detect third-party imports, optionally install into a venv
 # --------------------------------------------------------------------------
 def detect_deps(code):
@@ -411,7 +459,11 @@ def extract_code(reply):
     return m.group(1).rstrip() if m else None
 
 def smoke_test(code):
-    """Silent quality checks on generated code. Returns (passed, report, checks)."""
+    """Silent quality checks on generated code. Returns (passed, report, checks).
+    IMPORTANT: this only checks that the code PARSES and IMPORTS cleanly. It does
+    NOT run the tool's actual logic — doing that (e.g. via --help on a non-argparse
+    tool) would execute real work and produce false failures. Behaviour is verified
+    by the user pressing Run, not here."""
     checks = []
     # 1. syntax
     try:
@@ -419,38 +471,44 @@ def smoke_test(code):
         ast.parse(code)
         checks.append(("syntax", True, ""))
     except SyntaxError as e:
-        return False, f"SyntaxError: {e}", [("syntax", False, str(e))]
+        return False, f"SyntaxError at line {e.lineno}: {e.msg}", [("syntax", False, str(e))]
 
-    # write to a temp file for the runtime checks
+    # 2. import-ability: load the module WITHOUT running its __main__ block.
+    #    We import it as a module so top-level defs/imports are checked, but the
+    #    `if __name__ == '__main__':` guard does not fire.
     fd, path = tempfile.mkstemp(prefix="pysmith_test_", suffix=".py")
     try:
         with os.fdopen(fd, "w") as f:
             f.write(code)
-
-        # 2. import / top-level execution check via -c with a guard:
-        #    we run the file; if it has a __main__ guard, top-level import is safe.
-        #    a crash here that isn't "missing dependency" is a real failure.
+        # run a tiny harness that imports the file as a module (name != __main__)
+        harness = (
+            "import importlib.util, sys\n"
+            f"spec = importlib.util.spec_from_file_location('pysmith_candidate', {path!r})\n"
+            "mod = importlib.util.module_from_spec(spec)\n"
+            "try:\n"
+            "    spec.loader.exec_module(mod)\n"
+            "except (ModuleNotFoundError, ImportError) as e:\n"
+            "    print('DEP_MISSING:' + str(e)); sys.exit(0)\n"
+        )
         try:
-            proc = subprocess.run([sys.executable, path, "--help"],
+            proc = subprocess.run([sys.executable, "-c", harness],
                                   capture_output=True, stdin=subprocess.DEVNULL, timeout=20)
+            out = proc.stdout.decode("utf-8", errors="replace")
             err = proc.stderr.decode("utf-8", errors="replace")
-            # ModuleNotFoundError = needs a dependency, not a code bug -> not a hard fail
-            if "ModuleNotFoundError" in err or "ImportError" in err:
-                checks.append(("imports", True, "needs a third-party package (see /deps)"))
-            elif proc.returncode != 0 and ("Traceback" in err and "argparse" not in err
-                                           and "SystemExit" not in err):
-                # a real crash on --help (and not just 'no such option')
-                # only count as fail if it looks like a genuine exception at import time
-                if "Error" in err and "usage:" not in proc.stdout.decode("utf-8", errors="replace").lower():
-                    checks.append(("runtime", False, err.strip()[-400:]))
-                    return False, err.strip()[-400:], checks
-                else:
-                    checks.append(("runtime", True, ""))
+            if out.startswith("DEP_MISSING:"):
+                # needs a third-party package — not a code bug
+                checks.append(("imports", True, "needs a third-party package (use the deps button)"))
+            elif proc.returncode != 0:
+                # a genuine error at import/definition time (NameError, bad default, etc.)
+                msg = err.strip()[-500:] or "import failed"
+                checks.append(("imports", False, msg))
+                return False, msg, checks
             else:
-                checks.append(("runtime", True, ""))
+                checks.append(("imports", True, ""))
         except subprocess.TimeoutExpired:
-            checks.append(("runtime", False, "timed out on --help (waiting for input or infinite loop)"))
-            return False, "Timed out running --help", checks
+            # top-level code that blocks — unusual, but flag it
+            checks.append(("imports", False, "import timed out (top-level code is blocking)"))
+            return False, "Import timed out — there may be blocking code at module top level.", checks
         return True, "", checks
     finally:
         try: os.unlink(path)
@@ -473,7 +531,8 @@ def chat_with_autotest(messages, provider_id=None):
         passed, report, checks = smoke_test(code)
         rounds.append({"attempt": attempt + 1, "passed": passed,
                        "checks": [c[0] for c in checks if c[1]],
-                       "failed": [c[0] for c in checks if not c[1]]})
+                       "failed": [c[0] for c in checks if not c[1]],
+                       "report": "" if passed else report})
         if passed or attempt == AUTOTEST_MAX_ROUNDS:
             res["autotest"] = {"ran": True, "passed": passed, "rounds": rounds}
             return res
@@ -854,6 +913,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {"log": render_log(full=True), "runs": len(SESSION_LOG)})
         elif self.path == "/api/library":
             self._send(200, library_list())
+        elif self.path == "/api/sessions":
+            self._send(200, session_list())
         elif self.path == "/api/log.txt":
             blob = render_log(full=True).encode()
             self.send_response(200)
@@ -936,6 +997,13 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, library_load(data.get("id", "")))
         elif self.path == "/api/library/delete":
             self._send(200, library_delete(data.get("id", "")))
+        elif self.path == "/api/session/save":
+            self._send(200, session_save(data.get("id"), data.get("name", "untitled"),
+                                         data.get("code", ""), data.get("messages", [])))
+        elif self.path == "/api/session/load":
+            self._send(200, session_load(data.get("id", "")))
+        elif self.path == "/api/session/delete":
+            self._send(200, session_delete(data.get("id", "")))
         elif self.path == "/api/deps":
             self._send(200, {"deps": detect_deps(data.get("code", ""))})
         elif self.path == "/api/deps/install":
