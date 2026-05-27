@@ -75,10 +75,14 @@ PROVIDERS = {
     },
     "siliconflow": {
         "label": "SiliconFlow",
-        # NOTE: the real host is api.siliconflow.cn (NOT .com). The .com host was the
-        # reason every SiliconFlow call failed before.
-        "url": "https://api.siliconflow.cn/v1/chat/completions",
-        "models_url": "https://api.siliconflow.cn/v1/models?sub_type=chat",
+        # SiliconFlow runs TWO separate platforms whose keys are NOT interchangeable:
+        #   - International: cloud.siliconflow.COM  -> api.siliconflow.com
+        #   - China:         cloud.siliconflow.CN   -> api.siliconflow.cn
+        # A key made on one returns 401 on the other. We target .com because that's
+        # where cloud.siliconflow.com keys are issued. If your key is from the .cn
+        # site instead, change both URLs below back to .cn.
+        "url": "https://api.siliconflow.com/v1/chat/completions",
+        "models_url": "https://api.siliconflow.com/v1/models?sub_type=chat",
         "env": "SILICONFLOW_API_KEY",
         "kind": "openai",
         # biggest / strongest first (fallback only — live fetch overrides)
@@ -313,6 +317,35 @@ def persist_state():
 # come from hardcoded names drifting out of date.
 _MODEL_CACHE = {}
 
+# Some providers run multiple regional API hosts whose keys are NOT interchangeable
+# (a key from one returns 401 on the other). SiliconFlow is the prime example:
+# .com (international) vs .cn (China). We try the configured host first, then the
+# alternates, and REMEMBER whichever host accepted the key so every later call uses
+# it. This makes "which site was my key from?" a non-issue for the user.
+HOST_ALIASES = {
+    "siliconflow": ["api.siliconflow.com", "api.siliconflow.cn"],
+}
+# {provider_id: working_host} once discovered for the current key
+_HOST_OK = {}
+
+def _provider_urls(provider_id):
+    """Yield (chat_url, models_url) candidates for a provider, best-known host first."""
+    prov = PROVIDERS[provider_id]
+    base_chat = prov["url"]
+    base_models = prov.get("models_url", "")
+    aliases = HOST_ALIASES.get(provider_id)
+    if not aliases:
+        yield base_chat, base_models
+        return
+    # if we already know which host works for this key, use only that
+    known = _HOST_OK.get(provider_id)
+    hosts = [known] + [h for h in aliases if h != known] if known else list(aliases)
+    # derive the host currently in base_chat so we can swap it
+    cur_host = re.sub(r"^https?://([^/]+)/.*$", r"\1", base_chat)
+    for h in hosts:
+        yield (base_chat.replace(cur_host, h, 1),
+               base_models.replace(cur_host, h, 1) if base_models else "")
+
 # crude size ranking so "biggest first" still roughly holds for an unknown catalog
 def _model_rank(mid):
     s = mid.lower()
@@ -340,48 +373,66 @@ def fetch_models(provider_id, force=False):
     if not force and _MODEL_CACHE.get(provider_id):
         return {"models": _MODEL_CACHE[provider_id], "source": "live"}
     key = STATE.get("keys", {}).get(provider_id, "")
-    url = prov.get("models_url")
-    if not key or not url:
-        return {"models": list(prov["models"]), "source": "fallback",
-                "error": None if key else "no key yet"}
-    try:
-        req = urllib.request.Request(url, headers={
-            "Authorization": "Bearer " + key,
-            "User-Agent": f"pysmith/{__version__}",
-            "Accept": "application/json",
-        })
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            data = json.loads(resp.read().decode())
-        items = data.get("data", data if isinstance(data, list) else [])
-        ids = []
-        for it in items:
-            mid = it.get("id") if isinstance(it, dict) else str(it)
-            if not mid:
+    if not key:
+        return {"models": list(prov["models"]), "source": "fallback", "error": "no key yet"}
+
+    last_err = None
+    # try each candidate host (e.g. SiliconFlow .com then .cn) until one accepts the key
+    for chat_url, models_url in _provider_urls(provider_id):
+        if not models_url:
+            continue
+        host = re.sub(r"^https?://([^/]+)/.*$", r"\1", models_url)
+        try:
+            req = urllib.request.Request(models_url, headers={
+                "Authorization": "Bearer " + key,
+                "User-Agent": f"pysmith/{__version__}",
+                "Accept": "application/json",
+            })
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                data = json.loads(resp.read().decode())
+            items = data.get("data", data if isinstance(data, list) else [])
+            ids = []
+            for it in items:
+                mid = it.get("id") if isinstance(it, dict) else str(it)
+                if not mid:
+                    continue
+                low = mid.lower()
+                # keep chat/text LLMs only; drop embeddings/rerank/image/audio/video/tts/etc.
+                if any(b in low for b in ("embed", "rerank", "bge-", "whisper", "tts", "stt",
+                                          "stable-diffusion", "flux", "sdxl", "kolors", "cogvideo",
+                                          "wan-", "speech", "audio", "image", "video", "vl-",
+                                          "-vl", "vision", "ocr")):
+                    continue
+                ids.append(mid)
+            if not ids:
+                last_err = "no chat models returned"
                 continue
-            low = mid.lower()
-            # keep chat/text LLMs only; drop embeddings/rerank/image/audio/video/tts/etc.
-            if any(b in low for b in ("embed", "rerank", "bge-", "whisper", "tts", "stt",
-                                      "stable-diffusion", "flux", "sdxl", "kolors", "cogvideo",
-                                      "wan-", "speech", "audio", "image", "video", "vl-",
-                                      "-vl", "vision", "ocr")):
+            ids = sorted(set(ids), key=_model_rank, reverse=True)
+            _MODEL_CACHE[provider_id] = ids
+            if provider_id in HOST_ALIASES:
+                _HOST_OK[provider_id] = host   # remember the host that worked for this key
+            return {"models": ids, "source": "live", "host": host}
+        except urllib.error.HTTPError as e:
+            detail = ""
+            try: detail = e.read().decode(errors="replace")[:150]
+            except Exception: pass
+            if e.code == 401:
+                last_err = "key rejected (401)"
+                continue   # try the next host — a .cn key 401s on .com and vice versa
+            if e.code == 403:
+                last_err = "forbidden (403): " + detail
                 continue
-            ids.append(mid)
-        if not ids:
-            return {"models": list(prov["models"]), "source": "fallback",
-                    "error": "no chat models returned"}
-        ids = sorted(set(ids), key=_model_rank, reverse=True)
-        _MODEL_CACHE[provider_id] = ids
-        return {"models": ids, "source": "live"}
-    except urllib.error.HTTPError as e:
-        detail = ""
-        try: detail = e.read().decode(errors="replace")[:150]
-        except Exception: pass
-        msg = f"HTTP {e.code}"
-        if e.code == 401: msg = "key rejected (401) — check it in Settings"
-        elif e.code == 403: msg = "forbidden (403) — VPN/proxy or key issue"
-        return {"models": list(prov["models"]), "source": "fallback", "error": msg + (": "+detail if detail else "")}
-    except Exception as e:
-        return {"models": list(prov["models"]), "source": "fallback", "error": str(e)}
+            last_err = f"HTTP {e.code}" + (": "+detail if detail else "")
+        except Exception as e:
+            last_err = str(e)
+
+    # nothing worked → fall back to the static list, with a clear reason
+    hint = ""
+    if provider_id in HOST_ALIASES and last_err and "401" in last_err:
+        hint = (" — the key was rejected on every SiliconFlow host (.com and .cn). "
+                "Re-copy the key (watch for spaces), or check the account needs verification.")
+    return {"models": list(prov["models"]), "source": "fallback",
+            "error": (last_err or "could not reach provider") + hint}
 
 def provider_model_chain(provider_id):
     """The model order to try: live catalog if we have it, else the static fallback."""
@@ -716,8 +767,16 @@ def call_model(messages, provider_id=None):
     if chosen:
         chain = [chosen] + [m for m in chain if m != chosen]
 
+    # which host to call: the one fetch_models proved works for this key, else the
+    # configured one. (Handles SiliconFlow .com vs .cn automatically.)
+    chat_url = prov["url"]
+    for cu, _mu in _provider_urls(pid):
+        chat_url = cu
+        break
+
     last = None
     context_hit = False
+    _retried_host = [False]   # one-shot host re-discovery guard (mutable for closure-free use)
     for model in chain:
         try:
             headers = {
@@ -727,7 +786,7 @@ def call_model(messages, provider_id=None):
                 "Accept": "application/json",
             }
             body = {"model": model, "temperature": 0.3, "messages": messages}
-            data = _http_post(prov["url"], headers, body)
+            data = _http_post(chat_url, headers, body)
             reply = data["choices"][0]["message"]["content"]
             return {"reply": reply, "model": model, "provider": pid}
         except urllib.error.HTTPError as e:
@@ -746,8 +805,32 @@ def call_model(messages, provider_id=None):
                 return {"error": f"Blocked by Cloudflare (403/1010) before reaching "
                                  f"{prov['label']}. Usually a VPN/proxy or outdated client, not your key."}
             if e.code == 401:
+                # For a multi-host provider (SiliconFlow .com/.cn), a 401 may just mean
+                # we're hitting the wrong regional host for this key. Discover the right
+                # one and retry this same request once.
+                if pid in HOST_ALIASES and not _retried_host[0]:
+                    _retried_host[0] = True
+                    probe = fetch_models(pid, force=True)
+                    if probe.get("source") == "live" and _HOST_OK.get(pid):
+                        new_url = None
+                        for cu, _mu in _provider_urls(pid):
+                            new_url = cu; break
+                        if new_url and new_url != chat_url:
+                            chat_url = new_url
+                            # retry the very same model against the correct host
+                            try:
+                                body = {"model": model, "temperature": 0.3, "messages": messages}
+                                data = _http_post(chat_url, headers, body)
+                                reply = data["choices"][0]["message"]["content"]
+                                return {"reply": reply, "model": model, "provider": pid}
+                            except Exception as e2:
+                                last = f"{model}: retry on {_HOST_OK[pid]} failed: {e2}"
+                                continue
                 return {"error": f"{prov['label']} rejected the key (401). Check it in Settings — "
-                                 f"and confirm you're using a {prov['label']} key, not another provider's."}
+                                 f"and confirm you're using a {prov['label']} key, not another provider's."
+                                 + (f" For SiliconFlow, the key must be from the same site as the "
+                                    f"endpoint (cloud.siliconflow.com ↔ api.siliconflow.com)."
+                                    if pid == "siliconflow" else "")}
             if e.code == 429:
                 return {"error": f"{prov['label']} rate-limited this request (429): "
                                  f"{detail or 'slow down or check your quota'}."}
@@ -1473,6 +1556,7 @@ class Handler(BaseHTTPRequestHandler):
             fetched = None
             if STATE["keys"][pid]:
                 _MODEL_CACHE.pop(pid, None)
+                _HOST_OK.pop(pid, None)
                 fetched = fetch_models(pid, force=True)
             self._send(200, {"hasKey": bool(STATE["keys"][pid]), "saved": saved,
                              "models": (fetched or {}).get("models"),
