@@ -4,12 +4,13 @@
 
 # pysmith
 
-**An AI workspace for building Python tools — not a chatbot.**
-Talk through the tool, agree on what it should do, get a **testing version you run
-right there**, iterate on real output, and only when you're happy does it package a
-**release version** for GitHub.
+**An AI workspace for building Python GUI tools — not a chatbot.**
+Talk through the tool, agree on what it should do, get a **testing version that opens a real
+window you launch right there**, iterate on real behaviour, and only when you're happy does it
+package a **release version** for GitHub. Every tool is a graphical app tuned to run on Kali
+Linux under both **KDE Plasma** (desktop) and **Phosh** (phone / NetHunter Pro).
 
-`local app` · `Groq` · `stdlib only` · `your key never leaves your machine`
+`local app` · `Groq + more` · `GTK / Qt / Tk` · `your key never leaves your machine`
 
 </div>
 
@@ -59,32 +60,48 @@ python3 pysmith.py
 ## How it works
 
 When you describe a new tool, pysmith first runs a **structured intake** — the model
-generates a short set of tap-to-answer questions tailored to *that* tool (scan type, output
-format, dependencies, etc.), then builds precisely to your choices. A stronger engineering
-system prompt plus the auto-test loop means even smaller models produce working, defensive code.
+generates a short set of tap-to-answer questions tailored to *that* tool (toolkit, target
+screen, what the window shows, dependencies, etc.), then builds precisely to your choices.
+Every build is a single-file **GUI app**: adaptive layout that works on a wide KDE window or a
+narrow ~360px Phosh phone screen, threaded so it never freezes, with graceful errors when a
+Kali binary or the toolkit itself is missing. A stronger engineering system prompt plus the
+auto-test loop means even smaller models produce working, defensive code.
+
+The default toolkit is **GTK 3 via PyGObject** — the native Phosh stack that also runs fine
+under KDE — but you can pick PyQt5 or Tkinter in the intake.
 
 When you click **◆ Get ready for GitHub**, pysmith asks your username, repo name, branch,
 and license, then polishes the code and assembles a complete repo: a README with a one-line
-HTTPS install/update command, `install.sh`, `LICENSE`, `.gitignore`, and the exact `git` push
-commands (HTTPS, never SSH).
+HTTPS install/update command, `install.sh` (which installs the GUI toolkit via `apt` and a
+`.desktop` launcher so the tool lands in your app grid), `LICENSE`, `.gitignore`, and the exact
+`git` push commands (HTTPS, never SSH).
 
 ### The workspace
 
-It's a workspace, built around the **code and testing it** — not a wall of chat.
+It's a workspace, built around the **code and launching it** — not a wall of chat.
 
 - **Build dialogue** (left): describe the tool. pysmith agrees on scope first — it'll ask a
-  sharp question or lay out a quick plan before writing anything.
+  sharp question or lay out a quick plan before writing anything. **⎘ attach** a `.py` to load
+  it as the working tool, or attach logs / configs / sample data as context for the build.
 - **Tool pane** (right, top): the current script, syntax-highlighted, with a
   `TESTING` / `RELEASE` badge.
-- **Test console** (right, bottom): hit **▶ Run & Test** and the code actually executes on
-  your machine; stdout, stderr, exit code and timing land here. Double-click an error to fire
-  it straight back into the dialogue for a fix.
+- **Test console** (right, bottom): hit **▶ launch** and the GUI actually opens on your desktop.
+  pysmith catches startup problems (missing toolkit, no display, a crash) and reports them here;
+  **■ stop** closes the window. Double-click an error to fire it straight back into the dialogue
+  for a fix.
+- **⬇ deps**: detects the GUI toolkit (installs it with `apt`) and any pip packages (into a
+  managed venv) so the window can actually open.
+- **★ library**: snapshots the tool **at its current state** — code, the whole build
+  conversation, version badge and launch args — exactly like saving a chat. Reopen it later and
+  pick up precisely where you left off. Works-in-progress also auto-save to the **in progress**
+  tab.
 - **◆ Build release version**: when you're happy, this asks the model for the polished,
-  GitHub-ready form — top docstring, argparse CLI, error handling, comments, plus a README.
-- **⤓ Save**: testing versions go to `./forge/`, release versions to `./release/<name>/`.
+  GitHub-ready form, plus a README and a `.desktop` launcher.
+- **⤓ Save**: testing versions go to `~/pysmith-tools/forge/`, release versions to
+  `~/pysmith-tools/release/<name>/` (with a `.desktop` entry).
 
 The model is taught a **method**, not just "write code": agree first, ship a working testing
-version by default, iterate on real run results, and only produce the release version when
+GUI by default, iterate on real behaviour, and only produce the release version when
 asked. That's the `SYSTEM_PROMPT` at the top of `pysmith.py` — yours to tune.
 
 ---
@@ -97,7 +114,7 @@ asked. That's the `SYSTEM_PROMPT` at the top of `pysmith.py` — yours to tune.
 - **Local only.** The server binds `127.0.0.1` — nothing is exposed to the network. Your
   Groq key stays in the local process and is never sent to the browser.
 
-`Run & Test` executes as **your** user with no sandbox — that's the point (you're testing
+**▶ launch** runs the GUI as **your** user with no sandbox — that's the point (you're testing
 real tools), so take the review step seriously.
 
 ---
@@ -111,10 +128,12 @@ Top of `pysmith.py`:
   dropdown in the app; a failed call falls through that provider's chain. Edit the model
   strings to match what your accounts actually have access to.
 - **`DEFAULT_PROVIDER`** — which provider is active on first launch.
-- **`AUTOTEST_MAX_ROUNDS`** — after the model writes code, pysmith silently syntax-checks
-  and smoke-tests it, feeding failures back to the model up to this many times *before you
-  see it*. This is the main quality lever — a weaker model forced to fix its own mistakes
-  beats a stronger one that never checks.
+- **`AUTOTEST_MAX_ROUNDS`** — after the model writes code, pysmith silently syntax-checks it,
+  verifies it's **import-safe** (a GUI tool must not open its window at import time), and
+  smoke-imports it, feeding failures back to the model up to this many times *before you see
+  it*. It's tolerant of a headless build box — a missing display or toolkit isn't treated as a
+  bug. This is the main quality lever — a weaker model forced to fix its own mistakes beats a
+  stronger one that never checks.
 - **`SYSTEM_PROMPT`** — the tool-building method. Tighten to taste.
 - **`DANGER`** — the destructive-pattern tripwires.
 - **`PORT`** — default `8765` (auto-bumps if taken).
@@ -128,9 +147,13 @@ config file at `~/.config/pysmith/config.json`.
 
 ## Requirements
 
-- Python ≥ 3.8 (standard library only — pysmith itself needs no `pip install`)
-- A [Groq](https://console.groq.com) API key
-- A browser
+- Python ≥ 3.8 (pysmith itself is standard library only — no `pip install` to run it)
+- A [Groq](https://console.groq.com) API key (or any of the other configured providers)
+- A browser (for the workspace UI)
+- A GUI toolkit **for the tools you build** — installed automatically by the **⬇ deps** button,
+  or manually: `sudo apt install python3-gi gir1.2-gtk-3.0` (GTK 3, the default),
+  `python3-pyqt5` (PyQt5), or `python3-tk` (Tkinter)
+- A desktop session (KDE Plasma or Phosh) to actually see the windows your tools open
 
 ---
 

@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
 """
-pysmith  -  AI-assisted Python toolsmith (desktop app)
-======================================================
-A local workspace for building Python / Kali / CLI tools by talking to a model.
-You agree on the tool in a build dialogue, it writes a TESTING version you run
-right here, you iterate, and only when you ask does it package a RELEASE version.
+pysmith  -  AI-assisted Python GUI toolsmith (desktop app)
+==========================================================
+A local workspace for building real, graphical Python tools by talking to a model.
+Every tool it builds is a windowed GUI app tuned to run on Kali Linux under BOTH
+KDE Plasma (desktop) and Phosh (mobile / NetHunter Pro) — adaptive, touch-friendly,
+single-file. You agree on the tool in a build dialogue, it writes a TESTING version
+you launch right here, you iterate, and only when you ask does it package a RELEASE
+version (with a .desktop launcher so it lands in your app grid).
 
 This file is a tiny local server (standard library only). It:
   - serves the workspace UI to your browser
-  - keeps your Groq key on THIS machine (never sent to the browser)
-  - actually runs the generated code locally so "test it" is real
+  - keeps your API key on THIS machine (never sent to the browser)
+  - actually LAUNCHES the generated GUI locally so "test it" is real
+  - is GUI-aware: it detects the toolkit, runs with the right interpreter, surfaces
+    startup errors, and never blocks waiting for a window you left open
   - never auto-runs anything: you click run, and a destructive-pattern scan guards it
 
 Run:
@@ -34,7 +39,7 @@ import urllib.request
 import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-__version__ = "8.0.0"
+__version__ = "9.0.0"
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 # ==========================================================================
@@ -116,55 +121,84 @@ AUTOTEST_MAX_ROUNDS = 2
 HOST = "127.0.0.1"
 PORT = 8765
 
-# This is the heart of it: the model is taught to build tools the way a careful
-# senior engineer does -- agree first, testing version by default, release only
-# on request. Tune it to taste.
+# This is the heart of it: the model is taught to build GRAPHICAL tools the way a
+# careful senior engineer does -- agree first, testing version by default, release
+# only on request. It targets Kali Linux under both KDE Plasma and Phosh. Tune to taste.
 SYSTEM_PROMPT = """You are pysmith, a senior Python engineer who builds small, sharp, genuinely
-working command-line tools for a security / sysadmin user on Kali Linux. You write the kind of
-code a careful professional ships: correct, defensive, readable. Hold yourself to that bar
-regardless of how the request is phrased.
+working GRAPHICAL (GUI) desktop tools for a security / sysadmin user on Kali Linux. Every tool you
+produce opens a real window — never a bare command-line script. The user runs the same tool on a
+KDE Plasma desktop AND on a Phosh phone (Kali NetHunter Pro), so it must look right and be usable
+on both a large screen and a narrow ~360px touch screen. You write the kind of code a careful
+professional ships: correct, defensive, readable, responsive. Hold yourself to that bar regardless
+of how the request is phrased.
 
-ENGINEERING STANDARDS (apply to every script you write):
-- Correctness first. The code must actually run and do what was agreed. Mentally trace the
-  happy path AND the obvious failure paths before you output.
-- Validate inputs. Check args, file existence, ranges, formats. Never assume input is well-formed.
-- Fail gracefully and informatively: catch the exceptions that will realistically occur
-  (network timeouts, missing files, permission denied, malformed data, missing binaries),
-  print a clear message to stderr, and exit with a non-zero code. Never let a bare traceback
-  be the user experience for an expected error.
-- Wrap external binaries (nmap, hashcat, tcpdump, etc.) with subprocess; detect when the binary
-  is absent and tell the user exactly what to install.
-- No silent failure, no bare `except: pass`. No placeholder/stub functions presented as working.
-  No invented library APIs — if unsure a function exists, use a standard approach you are sure of.
-- Concurrency/timeouts where it matters (e.g. scanning many hosts) so the tool isn't unusably slow,
-  but keep it correct over clever.
-- Prefer the standard library. If a third-party package is genuinely needed, put the exact
-  `pip install X` line on ONE line BEFORE the code block.
+TOOLKIT (pick ONE, default to GTK 3 via PyGObject unless the user/intake says otherwise):
+- DEFAULT — GTK 3 with PyGObject (`gi`). It is the native Phosh stack, ships on Kali, is
+  touch-friendly, and runs fine under KDE. Use this unless told otherwise.
+- PyQt5 / PySide6 — only if the user asks or the tool is desktop-only / KDE-centric.
+- Tkinter — only for the very simplest tools, or when the user wants zero system dependencies.
+Whatever you choose, stay on ONE toolkit for the whole tool. Never mix toolkits.
+
+GUI ENGINEERING STANDARDS (apply to every tool you write):
+- It must actually open a window and do the agreed job when launched. Mentally trace startup,
+  the main interaction, and the obvious failure paths before you output.
+- ADAPTIVE LAYOUT IS MANDATORY. Assume the window may be only ~360px wide on Phosh. Use
+  expanding/scrolling containers (e.g. Gtk.ScrolledWindow, Gtk.Box with expand, Gtk.Grid that
+  reflows), never fixed pixel sizes that overflow a phone. Set a sane default size
+  (e.g. 480x640) and a small minimum; let content scroll rather than clip. Big, tap-sized
+  controls (≥40px tall). Don't assume a mouse.
+- NEVER FREEZE THE UI. Any work that blocks — running nmap/tcpdump/hashcat, network calls,
+  scanning many hosts, reading large files — MUST run off the main thread (threading.Thread)
+  and marshal results back to the GUI thread safely (GLib.idle_add for GTK; signals for Qt;
+  widget.after for Tkinter). The window must stay responsive with a visible busy/progress state.
+- Wrap external Kali binaries (nmap, hashcat, tcpdump, aircrack-ng, etc.) with subprocess.
+  Detect when the binary is absent (shutil.which) and show a clear in-window error/dialog telling
+  the user exactly what to install — never a silent failure or a raw traceback dialog.
+- DEGRADE GRACEFULLY IF THE TOOLKIT IS MISSING. At the very top, import the toolkit inside a
+  try/except. On failure print to stderr the exact install command and exit non-zero, e.g.:
+      sudo apt install python3-gi gir1.2-gtk-3.0      (GTK 3)
+      sudo apt install python3-pyqt5                  (PyQt5)
+      sudo apt install python3-tk                     (Tkinter)
+  For GTK also guard the version: `gi.require_version("Gtk", "3.0")` inside that try/except.
+- IMPORT-SAFE STRUCTURE (so pysmith can pre-check your code without opening a window): do ALL
+  widget construction inside a class and/or a main() function, and only build+run it under
+  `if __name__ == "__main__":`. Top-level code must be imports and definitions only — nothing
+  that opens a window, connects to a display, or blocks at import time.
+- Validate inputs in the UI: check fields, file existence, ranges, formats before acting; show
+  the problem inline (entry styling, a label, or a dialog), don't crash.
+- No silent failure, no bare `except: pass`, no placeholder/stub callbacks presented as working.
+  No invented toolkit APIs — if unsure a method exists, use a standard approach you are sure of.
+- Prefer the standard library for logic. The toolkit (PyGObject/PyQt/etc.) is the only expected
+  third-party dependency; if you genuinely need another package, put the exact install line on
+  ONE line BEFORE the code block (apt for system/GUI libs, pip for pure-Python libs).
 
 METHOD (the build dialogue):
 1. CLARIFY BEFORE BUILDING. If meaningful details are unresolved, do not dump code — surface the
-   decisions. (pysmith may run a structured intake for you; honour every answer it passes you
-   precisely.) Once the shape is clear, build.
-2. TESTING VERSION BY DEFAULT: ONE complete, runnable, single-file script. Lean but correct —
-   full input validation and error handling, but no packaging ceremony yet.
+   decisions. (pysmith may run a structured intake for you; honour every answer precisely,
+   including the chosen toolkit and whether it must fit a phone screen.) Once the shape is clear, build.
+2. TESTING VERSION BY DEFAULT: ONE complete, runnable, single-file GUI script. Lean but correct —
+   real widgets, real behaviour, full input validation, threaded work, graceful errors — but no
+   packaging ceremony yet.
 3. ITERATE on real feedback: when given a run result/error/log, return the FULL updated script
    (never a diff) and state briefly what you changed and why.
-4. RELEASE VERSION ONLY WHEN ASKED: top docstring with summary + usage example, clean argparse
-   CLI with --help, robust error handling, sensible exit codes, helpful comments, zero dead code.
+4. RELEASE VERSION ONLY WHEN ASKED: top docstring with summary + how to launch, clean class
+   structure, an optional minimal argparse for launch flags (e.g. --version) that does NOT replace
+   the GUI, robust error handling, helpful comments, zero dead code. Still a GUI app.
 5. SAFETY: no destructive operations (mass deletion, disk wipes, fork bombs) unless the user
    explicitly and unambiguously asks; if so, call it out. Assume it runs on the user's own machine.
 
 OUTPUT FORMAT: a tight message first (a few sentences). THEN, only when actually providing code,
-exactly ONE ```python fenced block with the entire script — never two blocks. When only planning
-or discussing, include no code block at all."""
+exactly ONE ```python fenced block with the entire single-file GUI script — never two blocks. When
+only planning or discussing, include no code block at all."""
 
 # Used to generate a tailored, clickable intake for a new tool request.
-INTAKE_PROMPT = """You are the requirements analyst for pysmith, a Python tool builder. The user
-wants to build a tool. Your job is to produce the SHORT, HIGH-VALUE set of questions needed to
-build EXACTLY what they want — no lazy or generic filler.
+INTAKE_PROMPT = """You are the requirements analyst for pysmith, a builder of GRAPHICAL (GUI) Python
+tools that must run on Kali Linux under both KDE Plasma (desktop) and Phosh (phone). The user wants
+to build a tool. Produce the SHORT, HIGH-VALUE set of questions needed to build EXACTLY the right
+GUI — no lazy or generic filler.
 
 Return ONLY a JSON object, no prose, no markdown fences:
-{"summary": "<one line restating what they want to build>",
+{"summary": "<one line restating the GUI tool they want to build>",
  "questions": [
    {"q": "<clear question>", "options": ["<opt1>", "<opt2>", "<opt3>"], "multi": false},
    ...
@@ -172,33 +206,45 @@ Return ONLY a JSON object, no prose, no markdown fences:
 
 Rules:
 - 3 to 6 questions MAX. Only ask what genuinely changes the code.
-- Tailor every question to THIS tool. A port scanner needs scan-type/output-format questions;
-  a log parser needs input-format/filter questions. Do not ask irrelevant things.
-- Always cover, where relevant: inputs (what/format), outputs (stdout/JSON/CSV/file), key
-  behaviour options, whether wrapping an external binary or pure-Python, and any third-party
-  dependency tolerance.
+- ALWAYS include a toolkit question with options like ["GTK 3 (works on KDE + Phosh)",
+  "PyQt5 (desktop/KDE)", "Tkinter (zero deps)"] — default-lead with GTK 3.
+- ALWAYS include a target-screen question: ["Phone + desktop (adaptive)", "Desktop only",
+  "Phone only"].
+- Tailor the rest to THIS tool: what the main window shows (e.g. table of results, live log,
+  form + output pane), what inputs the user gives (fields, file picker, target/range), whether it
+  wraps an external binary (nmap/hashcat/tcpdump/etc.) or is pure-Python, and how results are
+  presented/exported (in-window list, save to file, copy).
 - 2 to 4 options per question. Options must be concrete and mutually distinct. Set "multi": true
   only when picking several genuinely makes sense.
 - Prefer options the user can just tap. Keep them short."""
 
 # Used by the GitHub-ready flow to assemble repo files from the user's answers.
-GITHUB_PROMPT = """You are preparing a polished GitHub release of a Python tool. You will be given
-the final code and the user's repo details. Produce a complete, professional repo.
+GITHUB_PROMPT = """You are preparing a polished GitHub release of a Python GUI tool (it opens a
+window; it runs on Kali under KDE and Phosh). You will be given the final code and the user's repo
+details. Produce a complete, professional repo.
 
 Return ONLY a JSON object, no prose, no markdown fences:
 {"readme": "<full README.md markdown>",
  "gitignore": "<.gitignore contents>",
- "requirements": "<requirements.txt contents, or empty string if pure stdlib>",
+ "requirements": "<requirements.txt for pip-only deps, or empty string if none>",
+ "apt": "<space-separated apt packages the GUI needs, e.g. 'python3-gi gir1.2-gtk-3.0', or empty>",
  "description": "<one-line repo description>"}
 
 README requirements:
-- Title, one-line description, then a short paragraph on what it does.
+- Title, one-line description, then a short paragraph on what the GUI does and that it is adaptive
+  (works on KDE desktop and Phosh phone).
+- A "Requirements" section listing the system packages (the apt line) AND noting it appears in the
+  app menu after install.
 - An "Install" section with a ONE-LINE curl command that downloads and runs install.sh from the
   user's repo over HTTPS (never ssh). Use the raw.githubusercontent.com URL for their repo/branch.
   The same line should work for updates (re-running it).
-- A "Usage" section with real, copy-pasteable examples derived from the actual CLI in the code.
-- Requirements, and the license name.
-- Clean, scannable, professional. No fluff."""
+- A "Usage" section: how to launch it (from the app grid or by name), with a sentence on the main
+  window. Keep it real and copy-pasteable.
+- The license name. Clean, scannable, professional. No fluff.
+
+For "apt": detect the toolkit from the code. gi/PyGObject GTK3 -> "python3-gi gir1.2-gtk-3.0";
+GTK4 -> "python3-gi gir1.2-gtk-4.0"; libadwaita -> add "gir1.2-adw-1"; PyQt5 -> "python3-pyqt5";
+PySide6 -> "python3-pyside6"; tkinter -> "python3-tk". Empty string only if pure stdlib with no GUI."""
 
 DANGER = [
     r"rm\s+-rf\s+/", r":\(\)\s*\{", r"shutil\.rmtree\(\s*['\"]/", r"\bmkfs\b",
@@ -258,12 +304,16 @@ LIBRARY_DIR = os.path.join(os.path.expanduser("~"), ".local", "share", "pysmith"
 def _safe_id(name):
     return re.sub(r"[^A-Za-z0-9_\-]", "_", (name or "tool")).strip("_") or "tool"
 
-def library_save(name, code, messages):
-    """Persist a tool (its code + the conversation that built it) to the library."""
+def library_save(name, code, messages, version="testing", args="", sid=None):
+    """Snapshot a tool to the library at its CURRENT state: its code, the full build
+    conversation, the version badge, and the test args. Reopening it restores all of
+    that so you continue exactly where you left off — like saving a chat."""
     os.makedirs(LIBRARY_DIR, exist_ok=True)
     tid = _safe_id(name)
     rec = {"id": tid, "name": name or tid, "code": code,
-           "messages": messages or [], "saved": time.strftime("%Y-%m-%d %H:%M")}
+           "messages": messages or [], "version": version or "testing",
+           "args": args or "", "toolkit": (detect_toolkit(code or "") or {}).get("label"),
+           "from_session": sid, "saved": time.strftime("%Y-%m-%d %H:%M")}
     with open(os.path.join(LIBRARY_DIR, tid + ".json"), "w") as f:
         json.dump(rec, f)
     return {"id": tid, "saved": rec["saved"]}
@@ -279,7 +329,8 @@ def library_list():
             with open(os.path.join(LIBRARY_DIR, fn)) as f:
                 r = json.load(f)
             tools.append({"id": r.get("id"), "name": r.get("name"),
-                          "saved": r.get("saved"),
+                          "saved": r.get("saved"), "toolkit": r.get("toolkit"),
+                          "version": r.get("version", "testing"),
                           "lines": len((r.get("code") or "").splitlines())})
         except Exception:
             continue
@@ -305,12 +356,14 @@ def library_delete(tid):
 # --------------------------------------------------------------------------
 SESSION_DIR = os.path.join(os.path.expanduser("~"), ".local", "share", "pysmith", "sessions")
 
-def session_save(sid, name, code, messages):
-    """Auto-save the live conversation+code for a tool in progress."""
+def session_save(sid, name, code, messages, version="testing", args=""):
+    """Auto-save the live conversation+code for a tool in progress (its full state)."""
     os.makedirs(SESSION_DIR, exist_ok=True)
     sid = sid or time.strftime("s%Y%m%d-%H%M%S")
     rec = {"id": sid, "name": name or "untitled", "code": code or "",
-           "messages": messages or [], "updated": time.strftime("%Y-%m-%d %H:%M")}
+           "messages": messages or [], "version": version or "testing", "args": args or "",
+           "toolkit": (detect_toolkit(code or "") or {}).get("label"),
+           "updated": time.strftime("%Y-%m-%d %H:%M")}
     with open(os.path.join(SESSION_DIR, _safe_id(sid) + ".json"), "w") as f:
         json.dump(rec, f)
     return {"id": sid, "updated": rec["updated"]}
@@ -327,7 +380,7 @@ def session_list():
                 r = json.load(f)
             msgs = r.get("messages", [])
             out.append({"id": r.get("id"), "name": r.get("name"),
-                        "updated": r.get("updated"),
+                        "updated": r.get("updated"), "toolkit": r.get("toolkit"),
                         "turns": sum(1 for m in msgs if m.get("role") == "user"),
                         "hasCode": bool(r.get("code"))})
         except Exception:
@@ -349,33 +402,78 @@ def session_delete(sid):
         return {"error": str(e)}
 
 # --------------------------------------------------------------------------
+# GUI TOOLKITS  -- detect which windowing toolkit a tool uses, and how to get it
+# --------------------------------------------------------------------------
+# Maps a top-level import to (human label, apt packages to install it on Kali/Debian).
+# These are SYSTEM packages installed with apt, NOT pip — installing PyGObject/PyQt via
+# pip is fragile, so we never push them through the managed venv.
+GUI_TOOLKITS = {
+    "gi":      ("GTK (PyGObject)", "python3-gi gir1.2-gtk-3.0"),
+    "PyQt5":   ("PyQt5",           "python3-pyqt5"),
+    "PyQt6":   ("PyQt6",           "python3-pyqt6"),
+    "PySide6": ("PySide6",         "python3-pyside6"),
+    "PySide2": ("PySide2",         "python3-pyside2"),
+    "tkinter": ("Tkinter",         "python3-tk"),
+    "wx":      ("wxPython",        "python3-wxgtk4.0"),
+}
+
+def detect_toolkit(code):
+    """Return the GUI toolkit a tool uses, or None. Refines the apt line for GTK by
+    reading the requested GTK/Adw versions out of the code (3.0 vs 4.0, libadwaita)."""
+    tops = set()
+    for m in re.finditer(r"^\s*(?:import|from)\s+([a-zA-Z0-9_\.]+)", code, re.M):
+        tops.add(m.group(1).split(".")[0])
+    for mod, (label, apt) in GUI_TOOLKITS.items():
+        if mod in tops:
+            if mod == "gi":
+                apt_pkgs = ["python3-gi"]
+                gtk_ver = re.search(r"require_version\(\s*['\"]Gtk['\"]\s*,\s*['\"]([0-9.]+)['\"]", code)
+                apt_pkgs.append("gir1.2-gtk-4.0" if (gtk_ver and gtk_ver.group(1).startswith("4"))
+                                else "gir1.2-gtk-3.0")
+                if re.search(r"require_version\(\s*['\"]Adw['\"]", code) or "Adw" in code:
+                    apt_pkgs.append("gir1.2-adw-1")
+                apt = " ".join(apt_pkgs)
+            return {"module": mod, "label": label, "apt": apt}
+    return None
+
+# --------------------------------------------------------------------------
 # DEPENDENCIES  -- detect third-party imports, optionally install into a venv
 # --------------------------------------------------------------------------
 def detect_deps(code):
-    """Return third-party top-level imports (best-effort, stdlib-aware)."""
+    """Return third-party deps split into pip packages and a GUI toolkit (apt).
+    GUI toolkits are installed with apt (system), never pip, so they're reported
+    separately with the exact apt command."""
     std = getattr(sys, "stdlib_module_names", set())
     obvious = {"os","sys","re","io","json","time","math","socket","subprocess","argparse",
                "itertools","collections","random","hashlib","base64","struct","threading",
                "datetime","pathlib","shutil","csv","urllib","textwrap","glob","tempfile",
                "functools","typing","enum","dataclasses","queue","signal","select","ssl",
                "ipaddress","binascii","zlib","gzip","sqlite3","html","xml","http","email"}
-    mods = set()
+    toolkit_mods = set(GUI_TOOLKITS.keys())
+    pip = set()
     for m in re.finditer(r"^\s*(?:import|from)\s+([a-zA-Z0-9_\.]+)", code, re.M):
         top = m.group(1).split(".")[0]
-        if top and top not in std and top not in obvious and not top.startswith("_"):
-            mods.add(top)
-    return sorted(mods)
+        if (top and top not in std and top not in obvious
+                and top not in toolkit_mods and not top.startswith("_")):
+            pip.add(top)
+    tk = detect_toolkit(code)
+    return {"pip": sorted(pip), "toolkit": tk}
+
 
 VENV_DIR = os.path.join(os.path.expanduser("~"), ".local", "share", "pysmith", "venv")
 
 def install_deps(pkgs):
-    """Install packages into pysmith's managed venv. Returns log + the python path."""
+    """Install pure-Python (pip) packages into pysmith's managed venv. Returns log +
+    the python path. The venv is created WITH access to system site-packages so a tool
+    can use both pip packages here AND the system GUI toolkit (PyGObject/PyQt)."""
     if not pkgs:
-        return {"ok": True, "log": "no third-party packages — pure stdlib", "python": sys.executable}
+        return {"ok": True, "log": "no pip packages — pure stdlib", "python": sys.executable}
     try:
         if not os.path.isdir(VENV_DIR):
             import venv
-            venv.EnvBuilder(with_pip=True).create(VENV_DIR)
+            # system_site_packages=True so the venv can still import the apt-installed
+            # GUI toolkit (gi/PyQt5/...) which can't be pip-installed reliably.
+            venv.EnvBuilder(with_pip=True, system_site_packages=True).create(VENV_DIR)
         vpy = os.path.join(VENV_DIR, "bin", "python")
         if not os.path.exists(vpy):
             vpy = os.path.join(VENV_DIR, "Scripts", "python.exe")  # windows fallback
@@ -386,13 +484,48 @@ def install_deps(pkgs):
     except Exception as e:
         return {"ok": False, "log": f"venv/install failed: {e}", "python": sys.executable}
 
-# the interpreter used to run tools: the venv if it exists, else current
-def run_python():
+def install_apt(apt_pkgs):
+    """Install system GUI packages with apt. Needs sudo; on Kali this is the right way
+    to get PyGObject/PyQt/etc. Returns a log. Best-effort and clearly reports failures."""
+    pkgs = [p for p in (apt_pkgs or "").split() if p]
+    if not pkgs:
+        return {"ok": True, "log": "no system packages needed"}
+    import shutil as _sh
+    if not _sh.which("apt-get") and not _sh.which("apt"):
+        return {"ok": False, "log": "apt not found — this looks like a non-Debian system. "
+                                    "Install the toolkit with your package manager instead."}
+    apt_bin = _sh.which("apt-get") or _sh.which("apt")
+    cmd = ["sudo", apt_bin, "install", "-y", *pkgs] if os.geteuid() != 0 else [apt_bin, "install", "-y", *pkgs]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        out = (proc.stdout or "") + (proc.stderr or "")
+        ok = proc.returncode == 0
+        if not ok and "sudo" in cmd[0]:
+            out += ("\n[pysmith] If sudo needs a password it can't be entered here. "
+                    "Run this in your terminal:\n  sudo " + apt_bin + " install -y " + " ".join(pkgs))
+        return {"ok": ok, "log": out[-1800:]}
+    except Exception as e:
+        return {"ok": False, "log": f"apt install failed: {e}\nRun manually:\n  sudo {apt_bin} install -y {' '.join(pkgs)}"}
+
+# the interpreter used to run tools. For GUI tools we MUST use the system interpreter
+# (sys.executable) so the apt-installed toolkit (gi/PyQt/...) is importable; the managed
+# venv is only used for pure-Python pip deps (and is created with system site-packages,
+# so it can see the toolkit too).
+def run_python(code=None):
+    venv_py = None
     for cand in (os.path.join(VENV_DIR, "bin", "python"),
                  os.path.join(VENV_DIR, "Scripts", "python.exe")):
         if os.path.exists(cand):
-            return cand
-    return sys.executable
+            venv_py = cand
+            break
+    # If the code needs pip deps, prefer the venv (which also sees system packages).
+    # Otherwise use the plain system interpreter so the GUI toolkit is always present.
+    if code is not None:
+        d = detect_deps(code)
+        if d["pip"] and venv_py:
+            return venv_py
+        return sys.executable
+    return venv_py or sys.executable
 
 # ==========================================================================
 # helpers
@@ -461,9 +594,11 @@ def extract_code(reply):
 def smoke_test(code):
     """Silent quality checks on generated code. Returns (passed, report, checks).
     IMPORTANT: this only checks that the code PARSES and IMPORTS cleanly. It does
-    NOT run the tool's actual logic — doing that (e.g. via --help on a non-argparse
-    tool) would execute real work and produce false failures. Behaviour is verified
-    by the user pressing Run, not here."""
+    NOT open the window — doing that needs a display and would block. For GUI tools
+    it also verifies the code is import-safe (no window opens at import time) and is
+    TOLERANT of a headless/toolkit-less test box: a missing display or missing GUI
+    typelib is an environment fact here, not a bug in the generated tool. Real
+    behaviour is verified by the user pressing Run on their Kali machine."""
     checks = []
     # 1. syntax
     try:
@@ -473,14 +608,34 @@ def smoke_test(code):
     except SyntaxError as e:
         return False, f"SyntaxError at line {e.lineno}: {e.msg}", [("syntax", False, str(e))]
 
+    tk = detect_toolkit(code)
+
+    # 1b. import-safety for GUI tools: building/running the GUI must be guarded by
+    #     `if __name__ == "__main__":` (or a main() called only there), so importing
+    #     the module doesn't try to open a window. Catch the obvious mistake of a
+    #     top-level mainloop/run/show call.
+    if tk:
+        bad = re.search(r"^\s*(?:Gtk\.main\(\)|app\.run\(|window\.show_all\(\)|"
+                        r"\w+\.mainloop\(\)|sys\.exit\(\s*app\.exec)", code, re.M)
+        if bad and "__main__" not in code:
+            msg = ("GUI tool isn't import-safe: it opens/runs the window at module top "
+                   "level. Move all window construction and the main loop inside "
+                   "`if __name__ == \"__main__\":`.")
+            checks.append(("import-safe", False, msg))
+            return False, msg, checks
+        checks.append(("import-safe", True, ""))
+
     # 2. import-ability: load the module WITHOUT running its __main__ block.
-    #    We import it as a module so top-level defs/imports are checked, but the
-    #    `if __name__ == '__main__':` guard does not fire.
     fd, path = tempfile.mkstemp(prefix="pysmith_test_", suffix=".py")
+    # signatures meaning "this box just can't load the GUI" — never a code bug
+    ENV_SIGNS = ("Namespace", "not available", "cannot open display", "could not open display",
+                 "couldn't connect to display", "no display name", "Unable to init server",
+                 "Gtk couldn't be initialized", "GtkInitError", "QXcbConnection",
+                 "qt.qpa.plugin", "no Qt platform plugin", "xcb", "DISPLAY",
+                 "_tkinter.TclError", "libGL", "Gdk")
     try:
         with os.fdopen(fd, "w") as f:
             f.write(code)
-        # run a tiny harness that imports the file as a module (name != __main__)
         harness = (
             "import importlib.util, sys\n"
             f"spec = importlib.util.spec_from_file_location('pysmith_candidate', {path!r})\n"
@@ -489,15 +644,29 @@ def smoke_test(code):
             "    spec.loader.exec_module(mod)\n"
             "except (ModuleNotFoundError, ImportError) as e:\n"
             "    print('DEP_MISSING:' + str(e)); sys.exit(0)\n"
+            "except SystemExit as e:\n"
+            "    print('TOOLKIT_EXIT:' + str(e)); sys.exit(0)\n"
+            "except BaseException as e:\n"
+            "    import traceback; tb = traceback.format_exc()\n"
+            "    sys.stderr.write(tb)\n"
+            "    sys.exit(7)\n"
         )
         try:
             proc = subprocess.run([sys.executable, "-c", harness],
                                   capture_output=True, stdin=subprocess.DEVNULL, timeout=20)
             out = proc.stdout.decode("utf-8", errors="replace")
             err = proc.stderr.decode("utf-8", errors="replace")
+            blob = out + "\n" + err
             if out.startswith("DEP_MISSING:"):
-                # needs a third-party package — not a code bug
-                checks.append(("imports", True, "needs a third-party package (use the deps button)"))
+                note = "needs a package (use the deps button)"
+                if tk:
+                    note = f"needs the {tk['label']} toolkit — apt: {tk['apt']}"
+                checks.append(("imports", True, note))
+            elif out.startswith("TOOLKIT_EXIT:") or (tk and any(s in blob for s in ENV_SIGNS)):
+                # the tool bailed gracefully because the toolkit/display isn't on THIS box,
+                # or hit an environment-only error. Structurally fine.
+                checks.append(("imports", True, "toolkit/display not present on the test box "
+                                                 "(expected — runs on your Kali machine)"))
             elif proc.returncode != 0:
                 # a genuine error at import/definition time (NameError, bad default, etc.)
                 msg = err.strip()[-500:] or "import failed"
@@ -506,9 +675,9 @@ def smoke_test(code):
             else:
                 checks.append(("imports", True, ""))
         except subprocess.TimeoutExpired:
-            # top-level code that blocks — unusual, but flag it
-            checks.append(("imports", False, "import timed out (top-level code is blocking)"))
-            return False, "Import timed out — there may be blocking code at module top level.", checks
+            checks.append(("imports", False, "import timed out (top-level code is blocking — "
+                                             "is a window opening at import time?)"))
+            return False, "Import timed out — there may be blocking/GUI code at module top level.", checks
         return True, "", checks
     finally:
         try: os.unlink(path)
@@ -597,7 +766,51 @@ def make_github(code, details, provider_id=None):
     parsed = _parse_json_reply(res.get("reply", "")) or {}
     return {"github": parsed, "details": details}
 
-def run_code(code, args, confirmed):
+# Live GUI processes launched by Run, so we can report status and stop them.
+# {pid: {"proc": Popen, "name": str, "path": tmpfile, "started": ts}}
+RUNNING = {}
+_RUNNING_LOCK = threading.Lock()
+
+def _reap():
+    """Drop finished processes and clean up their temp files."""
+    with _RUNNING_LOCK:
+        for pid in list(RUNNING):
+            info = RUNNING[pid]
+            if info["proc"].poll() is not None:
+                try: os.unlink(info["path"])
+                except Exception: pass
+                RUNNING.pop(pid, None)
+
+def list_running():
+    _reap()
+    with _RUNNING_LOCK:
+        return {"running": [{"pid": pid, "name": i["name"],
+                             "seconds": round(time.time() - i["started"], 1)}
+                            for pid, i in RUNNING.items()]}
+
+def stop_running(pid):
+    """Terminate a launched GUI (and its children)."""
+    _reap()
+    with _RUNNING_LOCK:
+        info = RUNNING.get(pid)
+    if not info:
+        return {"ok": False, "error": "not running (already closed?)"}
+    proc = info["proc"]
+    try:
+        # kill the whole process group if we made one
+        try:
+            os.killpg(os.getpgid(proc.pid), 15)
+        except Exception:
+            proc.terminate()
+        try: proc.wait(timeout=3)
+        except Exception:
+            try: os.killpg(os.getpgid(proc.pid), 9)
+            except Exception: proc.kill()
+        return {"ok": True, "pid": pid}
+    finally:
+        _reap()
+
+def run_code(code, args, confirmed, name="tool"):
     danger = looks_dangerous(code)
     if danger and not confirmed:
         return {"needsConfirm": True, "patterns": danger}
@@ -608,18 +821,92 @@ def run_code(code, args, confirmed):
     except ValueError as e:
         return {"stdout": "", "stderr": f"Couldn't parse arguments: {e}", "exit": -1, "seconds": 0}
 
-    # unique temp file per run so concurrent/rapid runs can't clobber each other
-    fd, path = tempfile.mkstemp(prefix="pysmith_", suffix=".py")
-    try:
-        with os.fdopen(fd, "w") as f:
-            f.write(code)
+    tk = detect_toolkit(code)
+    interp = run_python(code)
 
+    # unique temp file per run so concurrent/rapid runs can't clobber each other.
+    # GUI launches keep their file alive until the window closes (cleaned up by _reap).
+    fd, path = tempfile.mkstemp(prefix="pysmith_", suffix=".py")
+    with os.fdopen(fd, "w") as f:
+        f.write(code)
+
+    # ----- GUI tool: LAUNCH it (don't block on the window) -----------------
+    if tk:
+        _reap()
+        # peek at the first ~1.8s of stderr to catch immediate failures
+        # (missing toolkit, missing display, a crash on startup), then leave it running.
+        try:
+            errf = tempfile.NamedTemporaryFile(prefix="pysmith_err_", suffix=".log", delete=False)
+            t0 = time.time()
+            proc = subprocess.Popen(
+                [interp, path] + argv,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=errf,
+                start_new_session=True,   # own process group -> clean stop later
+            )
+        except Exception as e:
+            try: os.unlink(path)
+            except Exception: pass
+            return {"stdout": "", "stderr": f"Could not launch: {e}", "exit": -1, "seconds": 0}
+
+        time.sleep(1.8)
+        rc = proc.poll()
+        try:
+            errf.flush(); errf.close()
+            with open(errf.name, "rb") as ef:
+                early_err = ef.read().decode("utf-8", errors="replace")
+        except Exception:
+            early_err = ""
+        finally:
+            try: os.unlink(errf.name)
+            except Exception: pass
+
+        if rc is not None and rc != 0:
+            # died on startup — diagnose toolkit / display problems precisely
+            hint = ""
+            if tk and ("Namespace" in early_err or "ModuleNotFoundError" in early_err
+                       or "ImportError" in early_err or "not available" in early_err):
+                hint = (f"\n[pysmith] The {tk['label']} toolkit isn't installed. Install it:\n"
+                        f"  sudo apt install {tk['apt']}\n"
+                        f"(or click the ⬇ deps button, which can do this for you).")
+            elif any(s in early_err for s in ("cannot open display", "no display name",
+                      "Unable to init server", "QXcbConnection", "no Qt platform plugin",
+                      "Gtk couldn't be initialized", "could not open display",
+                      "couldn't connect to display", "DISPLAY")):
+                hint = ("\n[pysmith] The GUI couldn't open a window — no display is available. "
+                        "Launch pysmith from inside your Kali desktop session (KDE or Phosh), "
+                        "not over a plain SSH shell. The tool itself looks fine.")
+            try: os.unlink(path)
+            except Exception: pass
+            return {"stdout": "", "stderr": (early_err or "the GUI exited immediately") + hint,
+                    "exit": rc, "seconds": round(time.time() - t0, 2), "gui": True}
+
+        if rc is not None and rc == 0:
+            # opened and closed cleanly within the peek window (or it's a one-shot)
+            try: os.unlink(path)
+            except Exception: pass
+            return {"stdout": "", "stderr": early_err, "exit": 0,
+                    "seconds": round(time.time() - t0, 2), "gui": True, "launched": False,
+                    "note": "ran and exited cleanly"}
+
+        # still running -> success: the window is open on the user's screen
+        with _RUNNING_LOCK:
+            RUNNING[proc.pid] = {"proc": proc, "name": name or "tool", "path": path, "started": t0}
+        return {"stdout": "", "stderr": early_err, "exit": 0,
+                "seconds": round(time.time() - t0, 2), "gui": True, "launched": True,
+                "pid": proc.pid,
+                "note": f"{tk['label']} window launched (pid {proc.pid}). It's open on your "
+                        f"desktop — interact with it there. Use ■ stop to close it."}
+
+    # ----- non-GUI fallback (rare now): capture output as before ----------
+    try:
         t0 = time.time()
         try:
             proc = subprocess.run(
-                [run_python(), path] + argv,
-                capture_output=True,           # capture as bytes, decode ourselves
-                stdin=subprocess.DEVNULL,      # no stdin -> input() gets clean EOF, never hangs
+                [interp, path] + argv,
+                capture_output=True,
+                stdin=subprocess.DEVNULL,
                 timeout=120)
         except subprocess.TimeoutExpired:
             return {"stdout": "", "stderr": "Killed: exceeded 120s (possible infinite loop, "
@@ -628,11 +915,8 @@ def run_code(code, args, confirmed):
         except Exception as e:
             return {"stdout": "", "stderr": f"Could not launch: {e}", "exit": -1, "seconds": 0}
 
-        # decode tolerantly: real Kali tool output can contain non-UTF8 bytes
         out = proc.stdout.decode("utf-8", errors="replace") if proc.stdout else ""
         errtxt = proc.stderr.decode("utf-8", errors="replace") if proc.stderr else ""
-
-        # make a bare EOFError from input() legible
         if proc.returncode != 0 and "EOFError" in errtxt and "input(" in code:
             errtxt += ("\n[pysmith] This tool reads from stdin via input(). The test runner "
                        "doesn't supply interactive input — pass values as command-line args instead.")
@@ -646,6 +930,7 @@ def save_tool(code, name, kind):
     name = re.sub(r"[^A-Za-z0-9_\-]", "_", (name or "tool")).strip("_") or "tool"
     # save under a fixed, predictable home location (never the volatile cwd)
     base = os.path.join(os.path.expanduser("~"), "pysmith-tools")
+    tk = detect_toolkit(code)
     if kind == "release":
         d = os.path.join(base, "release", name)
         os.makedirs(d, exist_ok=True)
@@ -656,9 +941,18 @@ def save_tool(code, name, kind):
         except Exception: pass
         readme = os.path.join(d, "README.md")
         if not os.path.exists(readme):
+            launch = f"Launch from your app grid, or run:\n\n```bash\npython3 {name}.py\n```"
+            apt_note = f"\n\nNeeds: `sudo apt install {tk['apt']}`" if tk else ""
             with open(readme, "w") as f:
-                f.write(f"# {name}\n\nBuilt with pysmith.\n\n## Usage\n\n```bash\npython3 {name}.py\n```\n")
-        return {"path": d}
+                f.write(f"# {name}\n\nA graphical tool built with pysmith.{apt_note}\n\n## Usage\n\n{launch}\n")
+        # a .desktop launcher so a GUI tool appears in KDE / Phosh
+        if tk:
+            dt = os.path.join(d, name + ".desktop")
+            with open(dt, "w") as f:
+                f.write("[Desktop Entry]\nType=Application\n"
+                        f"Name={name}\nComment=Built with pysmith\n"
+                        f"Exec=python3 {pyp}\nTerminal=false\nCategories=Utility;Security;\n")
+        return {"path": d, "toolkit": tk["label"] if tk else None}
     else:
         d = os.path.join(base, "forge")
         os.makedirs(d, exist_ok=True)
@@ -667,7 +961,7 @@ def save_tool(code, name, kind):
             f.write(code + "\n")
         try: os.chmod(pyp, 0o755)
         except Exception: pass
-        return {"path": pyp}
+        return {"path": pyp, "toolkit": tk["label"] if tk else None}
 
 LICENSES = {
     "MIT": ("MIT License\n\nCopyright (c) {year} {holder}\n\nPermission is hereby granted, "
@@ -686,22 +980,39 @@ LICENSES = {
             "SOFTWARE.\n"),
 }
 
-def _install_sh(user, repo, branch, name):
-    """A smart one-file installer that works via curl|bash or from a clone."""
+def _install_sh(user, repo, branch, name, apt_deps=""):
+    """A smart one-file installer that works via curl|bash or from a clone. Installs the
+    GUI toolkit (apt), the script, a CLI launcher, AND a .desktop entry so the tool shows
+    up in the KDE / Phosh app grid."""
+    apt_line = ""
+    if apt_deps.strip():
+        apt_line = f'''
+# install the GUI toolkit this tool needs
+APT_PKGS="{apt_deps.strip()}"
+if command -v apt-get >/dev/null 2>&1; then
+  echo "installing toolkit: $APT_PKGS (may prompt for sudo)…"
+  sudo apt-get update -qq || true
+  sudo apt-get install -y $APT_PKGS || echo "WARN: could not auto-install $APT_PKGS — install them manually"
+else
+  echo "NOTE: install these with your package manager: $APT_PKGS"
+fi
+'''
     return f"""#!/usr/bin/env bash
 # {repo} installer — one-line install/update over HTTPS:
 #   curl -fsSL https://raw.githubusercontent.com/{user}/{repo}/{branch}/install.sh | bash
 set -euo pipefail
 REPO="{user}/{repo}"; BRANCH="{branch}"
 SRC="$HOME/.local/share/{repo}"; BIN="$HOME/.local/bin"; LAUNCH="$BIN/{name}"
+APPS="$HOME/.local/share/applications"; ICONS="$HOME/.local/share/icons"
 
 command -v python3 >/dev/null 2>&1 || {{ echo "python3 required: sudo apt install python3"; exit 1; }}
-
-mkdir -p "$SRC" "$BIN"
+{apt_line}
+mkdir -p "$SRC" "$BIN" "$APPS" "$ICONS"
 SELF_DIR="$( cd "$( dirname "${{BASH_SOURCE[0]:-$0}}" )" 2>/dev/null && pwd || true )"
 if [ -n "$SELF_DIR" ] && [ -f "$SELF_DIR/{name}.py" ]; then
   cp -f "$SELF_DIR/{name}.py" "$SRC/"
   [ -f "$SELF_DIR/requirements.txt" ] && cp -f "$SELF_DIR/requirements.txt" "$SRC/" || true
+  [ -f "$SELF_DIR/{name}.png" ] && cp -f "$SELF_DIR/{name}.png" "$ICONS/" || true
 else
   if command -v git >/dev/null 2>&1; then
     if [ -d "$SRC/.git" ]; then git -C "$SRC" pull --ff-only --quiet || true
@@ -714,21 +1025,34 @@ else
   fi
 fi
 
-# install python deps if any
+# install pure-python deps if any
 [ -f "$SRC/requirements.txt" ] && python3 -m pip install -r "$SRC/requirements.txt" --break-system-packages -q 2>/dev/null || true
 
+# CLI launcher (uses system python3 so the system toolkit is importable)
 cat > "$LAUNCH" <<EOF
 #!/usr/bin/env bash
 exec python3 "$SRC/{name}.py" "\\$@"
 EOF
 chmod +x "$LAUNCH"
 
+# desktop entry -> appears in the KDE / Phosh app grid
+cat > "$APPS/{name}.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name={name}
+Comment={repo} — built with pysmith
+Exec=python3 $SRC/{name}.py
+Terminal=false
+Categories=Utility;Security;
+EOF
+update-desktop-database "$APPS" >/dev/null 2>&1 || true
+
 case ":$PATH:" in *":$BIN:"*) ;; *)
   RC="$HOME/.bashrc"; [ -n "${{ZSH_VERSION:-}}" ] && RC="$HOME/.zshrc"
   echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$RC"
   echo "added $BIN to PATH in $RC — run: source $RC" ;;
 esac
-echo "installed. run: {name}"
+echo "installed. launch from your app grid, or run: {name}"
 """
 
 def write_github_repo(code, name, gh, details):
@@ -751,9 +1075,9 @@ def write_github_repo(code, name, gh, details):
 
     # README (AI-generated, with fallback)
     readme = gh.get("readme") or (
-        f"# {repo}\n\n{gh.get('description','A Python tool built with pysmith.')}\n\n"
+        f"# {repo}\n\n{gh.get('description','A graphical Python tool built with pysmith.')}\n\n"
         f"## Install\n\n```bash\ncurl -fsSL https://raw.githubusercontent.com/{user}/{repo}/{branch}/install.sh | bash\n```\n\n"
-        f"## Usage\n\n```bash\n{name} --help\n```\n")
+        f"## Usage\n\nLaunch it from your app grid (KDE / Phosh), or run:\n\n```bash\n{name}\n```\n")
     with open(os.path.join(d, "README.md"), "w") as f:
         f.write(readme)
 
@@ -767,12 +1091,29 @@ def write_github_repo(code, name, gh, details):
         with open(os.path.join(d, "requirements.txt"), "w") as f:
             f.write(reqs + "\n")
 
-    # install.sh
+    # install.sh (installs the GUI toolkit via apt + a .desktop launcher)
+    apt_deps = (gh.get("apt") or "").strip()
+    if not apt_deps:
+        tk = detect_toolkit(code)
+        apt_deps = tk["apt"] if tk else ""
     ish = os.path.join(d, "install.sh")
     with open(ish, "w") as f:
-        f.write(_install_sh(user, repo, branch, name))
+        f.write(_install_sh(user, repo, branch, name, apt_deps))
     try: os.chmod(ish, 0o755)
     except Exception: pass
+
+    # .desktop entry so the GUI tool appears in the KDE / Phosh app grid
+    desktop = (
+        "[Desktop Entry]\n"
+        "Type=Application\n"
+        f"Name={name}\n"
+        f"Comment={gh.get('description', repo + ' — built with pysmith')}\n"
+        f"Exec=python3 %h/.local/share/{repo}/{name}.py\n"
+        "Terminal=false\n"
+        "Categories=Utility;Security;\n"
+    )
+    with open(os.path.join(d, name + ".desktop"), "w") as f:
+        f.write(desktop)
 
     # LICENSE
     lic = LICENSES.get(license_name)
@@ -913,6 +1254,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {"log": render_log(full=True), "runs": len(SESSION_LOG)})
         elif self.path == "/api/library":
             self._send(200, library_list())
+        elif self.path == "/api/running":
+            self._send(200, list_running())
         elif self.path == "/api/sessions":
             self._send(200, session_list())
         elif self.path == "/api/log.txt":
@@ -968,11 +1311,13 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, chat_with_autotest(messages, provider))
         elif self.path == "/api/run":
             result = run_code(data.get("code", ""), data.get("args", ""),
-                              bool(data.get("confirm")))
+                              bool(data.get("confirm")), data.get("name", "tool"))
             # log only actual runs (not the confirm-gate response)
             if "needsConfirm" not in result:
                 log_run(data.get("name", "tool"), data.get("args", ""), result)
             self._send(200, result)
+        elif self.path == "/api/stop":
+            self._send(200, stop_running(int(data.get("pid", 0) or 0)))
         elif self.path == "/api/fixlog":
             convo = data.get("messages", [])
             self._send(200, fix_from_log(data.get("code", ""), convo, data.get("provider")))
@@ -992,22 +1337,27 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {"runs": 0})
         elif self.path == "/api/library/save":
             self._send(200, library_save(data.get("name", "tool"), data.get("code", ""),
-                                         data.get("messages", [])))
+                                         data.get("messages", []),
+                                         data.get("version", "testing"),
+                                         data.get("args", ""), data.get("sessionId")))
         elif self.path == "/api/library/load":
             self._send(200, library_load(data.get("id", "")))
         elif self.path == "/api/library/delete":
             self._send(200, library_delete(data.get("id", "")))
         elif self.path == "/api/session/save":
             self._send(200, session_save(data.get("id"), data.get("name", "untitled"),
-                                         data.get("code", ""), data.get("messages", [])))
+                                         data.get("code", ""), data.get("messages", []),
+                                         data.get("version", "testing"), data.get("args", "")))
         elif self.path == "/api/session/load":
             self._send(200, session_load(data.get("id", "")))
         elif self.path == "/api/session/delete":
             self._send(200, session_delete(data.get("id", "")))
         elif self.path == "/api/deps":
-            self._send(200, {"deps": detect_deps(data.get("code", ""))})
+            self._send(200, detect_deps(data.get("code", "")))
         elif self.path == "/api/deps/install":
-            self._send(200, install_deps(data.get("deps", [])))
+            self._send(200, install_deps(data.get("pip", []) or data.get("deps", [])))
+        elif self.path == "/api/apt/install":
+            self._send(200, install_apt(data.get("apt", "")))
         elif self.path == "/api/polish":
             convo = data.get("messages", [])
             self._send(200, polish_round(data.get("code", ""), convo, data.get("provider")))
@@ -1064,6 +1414,7 @@ def main():
     url = f"http://{HOST}:{port}"
     srv = ThreadingHTTPServer((HOST, port), Handler)
     print(f"\n  pysmith v{__version__}  \u2014  {url}")
+    print(f"  building: graphical tools for Kali (KDE + Phosh)")
     have = [PROVIDERS[pid]["label"] for pid in PROVIDERS if STATE["keys"].get(pid)]
     if have:
         print(f"  keys loaded for: {', '.join(have)}")
