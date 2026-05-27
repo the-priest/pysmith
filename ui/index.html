@@ -770,9 +770,12 @@ function clearThinking(){ const m = $("#thinkingMsg"); if(m) m.remove(); }
 const input = $("#input");
 input.addEventListener("input", ()=>{ input.style.height="auto"; input.style.height=Math.min(input.scrollHeight,140)+"px"; });
 input.addEventListener("keydown", e=>{ if(e.key==="Enter" && !e.shiftKey){ e.preventDefault(); send(); }});
-$("#sendBtn").onclick = send;
+$("#sendBtn").onclick = () => send();   // wrap so the click EVENT is never passed as the message
 
 async function send(forced){
+  // defensive: only accept a STRING as a forced message. A click handler could pass a
+  // PointerEvent; that must never become the message text (the "[object PointerEvent]" bug).
+  if(typeof forced !== "string") forced = null;
   const typed = forced || input.value.trim();
   const hasAttach = state.attachments.length > 0;
   // allow sending with attachments only (no typed text)

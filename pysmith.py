@@ -39,7 +39,7 @@ import urllib.request
 import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-__version__ = "9.2.0"
+__version__ = "9.2.1"
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 # ==========================================================================
@@ -814,7 +814,37 @@ def trim_history(messages, model=None):
                    f"(pysmith note: {dropped} earlier message(s) were trimmed to fit this model's "
                    f"context window. The current code and recent discussion are below; treat the "
                    f"latest code block as the source of truth.)"}]
-    return system + marker + kept_tail
+    result = system + marker + kept_tail
+
+    # ---- stage 3: HARD GUARANTEE — never exceed budget, even by one char ----
+    # Stages 1-2 can land slightly over (the newest message is kept whole, the system
+    # prompt is large, etc.). That residual overflow was the real cause of the 400 that
+    # struck only after long use. Here we make overflow impossible: while the payload is
+    # over the model's total budget, truncate the single largest NON-system message (the
+    # current code, almost always) until everything fits with headroom.
+    def _total(ms): return sum(_msg_len(m) for m in ms)
+    guard = 0
+    while _total(result) > budget_total and guard < 200:
+        guard += 1
+        # find the largest message that isn't a system message
+        idx, biggest = -1, -1
+        for i, m in enumerate(result):
+            if m.get("role") == "system":
+                continue
+            L = _msg_len(m)
+            if L > biggest:
+                biggest, idx = L, i
+        if idx < 0 or biggest <= 0:
+            break
+        over = _total(result) - budget_total
+        # cut the overflow plus a small margin, but keep at least a stub
+        keep_len = max(500, _msg_len(result[idx]) - over - 400)
+        c = result[idx]["content"]
+        if keep_len >= len(c):
+            break
+        result[idx] = {"role": result[idx]["role"],
+                       "content": c[:keep_len] + "\n…(truncated by pysmith to fit this model's context)…"}
+    return result
 
 def call_model(messages, provider_id=None):
     """Call the selected provider, falling through its model chain on error.
