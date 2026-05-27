@@ -681,69 +681,113 @@ def _http_post(url, headers, body, timeout=120):
         return json.loads(resp.read().decode())
 
 # --------------------------------------------------------------------------
-# CONTEXT BUDGET  -- keep requests under the model's window on long sessions
+# CONTEXT BUDGET  -- keep requests under the ACTIVE model's real window
 # --------------------------------------------------------------------------
-# Rough char budget for the whole message list sent to the model. ~4 chars/token,
-# so ~120k chars ≈ 30k tokens of input — comfortable for 32k+ context models while
-# leaving room for the reply. Tune if you pin a small-context model.
-CONTEXT_CHAR_BUDGET = 120_000
+# The previous version used one fixed budget (120k chars). That was the bug behind
+# "works on a fresh tool, dies after long use": a long session would fall through
+# the model chain to a SMALL-context model (e.g. an 8k-token model) for which 120k
+# chars is wildly over the limit — so the request 400'd even though trimming "ran".
+# Now we budget against the specific model being called.
+#
+# Context windows in TOKENS (input side). ~3.5 chars/token for code-heavy text, and
+# we reserve room for the reply, so usable input chars ≈ tokens * 3. Unknown models
+# get a conservative default so we never overshoot a small one.
+MODEL_CONTEXT_TOKENS = {
+    # Groq
+    "llama-3.3-70b-versatile": 128000, "openai/gpt-oss-120b": 128000,
+    "openai/gpt-oss-20b": 128000, "gemma2-9b-it": 8192, "llama-3.1-8b-instant": 128000,
+    # SiliconFlow
+    "deepseek-ai/deepseek-v3": 64000, "qwen/qwen2.5-72b-instruct": 32000,
+    "qwen/qwen2.5-coder-32b-instruct": 32000, "deepseek-ai/deepseek-v2.5": 32000,
+    "qwen/qwen2.5-7b-instruct": 32000,
+    # Google
+    "gemini-2.5-pro": 1000000, "gemini-2.5-flash": 1000000, "gemini-2.0-flash": 1000000,
+    "gemini-1.5-pro": 2000000, "gemini-1.5-flash": 1000000,
+    # Novita
+    "deepseek/deepseek-v3": 64000, "qwen/qwen-2.5-72b-instruct": 32000,
+    "meta-llama/llama-3.1-70b-instruct": 128000, "meta-llama/llama-3.1-8b-instruct": 128000,
+}
+DEFAULT_CONTEXT_TOKENS = 16000      # safe assumption for an unknown model
+REPLY_RESERVE_TOKENS   = 4000       # leave room for the model's answer
+
+def context_budget_chars(model):
+    """Usable input-char budget for a specific model, conservatively converted from
+    its token window with headroom reserved for the reply."""
+    toks = MODEL_CONTEXT_TOKENS.get((model or "").lower(), DEFAULT_CONTEXT_TOKENS)
+    usable = max(2000, toks - REPLY_RESERVE_TOKENS)
+    # ~3 input chars per token (conservative for code), capped so we never send an
+    # absurdly huge request even to a million-token model (keeps latency/cost sane).
+    return min(usable * 3, 300_000)
 
 def _msg_len(m):
     return len(m.get("content", "") or "")
 
-def trim_history(messages):
-    """Keep a long build conversation under the context budget without losing what
-    matters. Strategy: ALWAYS keep the system prompt and the most recent messages;
-    ALWAYS keep the latest assistant turn that actually contains code (that's the
-    current tool); drop the stale middle, leaving a marker so the model knows.
-    This is the fix for 'it errors once the conversation gets big'."""
+# matches a fenced code block so we can collapse superseded copies
+_CODE_FENCE = re.compile(r"```[a-zA-Z0-9_+-]*\n.*?```", re.S)
+
+def trim_history(messages, model=None):
+    """Keep a long build conversation under the ACTIVE model's window without losing
+    what matters. Two-stage:
+      1. COLLAPSE every OLD assistant code block into a one-line placeholder — only the
+         most recent full script is kept verbatim. (This is the real fix: long sessions
+         accumulate many full copies of the same growing program, and that redundancy,
+         not the chat, is what blows the context window.)
+      2. If still over budget, drop the stale middle of the conversation, keeping the
+         system prompt, the current code, and the most recent turns; leave a marker.
+    """
     if not messages:
         return messages
-    total = sum(_msg_len(m) for m in messages)
-    if total <= CONTEXT_CHAR_BUDGET:
-        return messages
+    budget_total = context_budget_chars(model)
 
     system = [m for m in messages if m.get("role") == "system"]
-    body = [m for m in messages if m.get("role") != "system"]
-    sys_len = sum(_msg_len(m) for m in system)
-    budget = CONTEXT_CHAR_BUDGET - sys_len
+    body   = [m for m in messages if m.get("role") != "system"]
 
-    # index of the last assistant message that carries a fenced code block — the
-    # current tool. We never want to drop that.
+    # ---- stage 1: collapse superseded code blocks ----
     last_code_idx = None
     for i in range(len(body) - 1, -1, -1):
         if body[i].get("role") == "assistant" and "```" in (body[i].get("content") or ""):
             last_code_idx = i
             break
+    if last_code_idx is not None:
+        for i in range(len(body)):
+            if i == last_code_idx:
+                continue
+            m = body[i]
+            if m.get("role") == "assistant" and "```" in (m.get("content") or ""):
+                collapsed = _CODE_FENCE.sub("`[earlier version of the code — superseded by the latest below]`",
+                                            m["content"])
+                body[i] = {"role": m["role"], "content": collapsed}
 
-    kept_tail = []
-    used = 0
-    # walk from the newest message backwards, keeping until we run out of budget
+    sys_len = sum(_msg_len(m) for m in system)
+    budget  = budget_total - sys_len
+    total   = sum(_msg_len(m) for m in body)
+    if total <= budget:
+        return system + body   # stage-1 collapse alone got us under the limit
+
+    # ---- stage 2: drop the stale middle, force-keeping the current code ----
+    # recompute the code index after collapse (it didn't move)
+    kept_tail, used = [], 0
     for i in range(len(body) - 1, -1, -1):
         m = body[i]
         L = _msg_len(m)
         if used + L <= budget or not kept_tail:
-            kept_tail.append(m)
-            used += L
+            kept_tail.append(m); used += L
         elif i == last_code_idx:
-            # force-keep the current tool even if it's older than the tail window,
-            # truncating it only if it alone blows the budget
             content = m.get("content") or ""
             if L > budget:
-                content = content[: max(2000, budget - 200)] + "\n# …(truncated by pysmith to fit context)…"
-            kept_tail.append({"role": m["role"], "content": content})
-            used += min(L, budget)
+                content = content[: max(2000, budget - 200)] + "\n# …(truncated by pysmith to fit this model)…"
+            kept_tail.append({"role": m["role"], "content": content}); used += min(L, budget)
         else:
             continue
     kept_tail.reverse()
 
-    dropped = len(body) - len([m for m in kept_tail])
+    dropped = len(body) - len(kept_tail)
     marker = []
     if dropped > 0:
         marker = [{"role": "user", "content":
-                   f"(pysmith note: {dropped} earlier message(s) were trimmed to stay within the "
-                   f"model's context window. The current code and recent discussion are below; "
-                   f"treat the latest code block as the source of truth.)"}]
+                   f"(pysmith note: {dropped} earlier message(s) were trimmed to fit this model's "
+                   f"context window. The current code and recent discussion are below; treat the "
+                   f"latest code block as the source of truth.)"}]
     return system + marker + kept_tail
 
 def call_model(messages, provider_id=None):
@@ -758,8 +802,8 @@ def call_model(messages, provider_id=None):
         return {"error": f"No API key for {prov['label']}. Add it in Settings, "
                          f"or set {prov['env']} and restart."}
 
-    # keep long build conversations within the model's context window
-    messages = trim_history(messages)
+    # raw history; trimmed PER MODEL inside the loop (each model has its own window)
+    raw_messages = messages
 
     # model order: a user-chosen model (if set) first, then the rest of the LIVE chain
     chosen = STATE.get("models", {}).get(pid)
@@ -778,6 +822,16 @@ def call_model(messages, provider_id=None):
     context_hit = False
     _retried_host = [False]   # one-shot host re-discovery guard (mutable for closure-free use)
     for model in chain:
+        # trim to THIS model's context window — the fix for "dies after long use":
+        # a small-context model deeper in the chain now gets a request sized for it.
+        messages = trim_history(raw_messages, model)
+        # pre-flight: if even the trimmed payload won't fit this model (e.g. system
+        # prompt + current code alone exceeds a tiny 8k window), skip it instead of
+        # sending a request we know will 400. A bigger model later in the chain may fit.
+        if sum(_msg_len(m) for m in messages) > context_budget_chars(model):
+            last = f"{model}: skipped (payload exceeds its context window)"
+            context_hit = True
+            continue
         try:
             headers = {
                 "Content-Type": "application/json",
@@ -844,10 +898,13 @@ def call_model(messages, provider_id=None):
 
     if context_hit:
         return {"error": "context_overflow",
-                "detail": "This conversation got too long for the model's context window. "
-                          "Start a new tool (＋ new tool) to reset — your saved work in the library "
-                          "is untouched — or trim the conversation. (pysmith already trims old turns "
-                          "automatically; a single huge tool can still exceed the limit.)"}
+                "detail": "Your current tool plus the build conversation is too large for the "
+                          "available model(s). pysmith already collapses old code revisions and "
+                          "trims old turns automatically, so this means the tool itself is now very "
+                          "big. Two fixes: pick a larger-context model in Settings (Gemini and the "
+                          "70B/120B models have huge windows), or hit ＋ new tool to start fresh — "
+                          "your saved work in the library is untouched. You can also save the current "
+                          "tool to the library first, then reopen it in a clean session to keep going."}
     return {"error": f"{prov['label']} chain failed. Last: {last}. "
                      f"Try Settings → refresh models, or pick a different model/provider."}
 
