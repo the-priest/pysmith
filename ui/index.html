@@ -475,9 +475,13 @@
     <select id="keyProvider" class="provider-pick" style="width:100%;margin-bottom:14px"></select>
     <label>API key for the selected provider</label>
     <input type="password" id="keyInput" placeholder="paste key…">
-    <label>Model (biggest first — pick one to pin it)</label>
-    <select id="keyModel" class="provider-pick" style="width:100%;margin-bottom:14px"></select>
-    <p style="font-size:12px">Models are listed biggest→strongest first. Edit the lists in <span style="font-family:var(--mono);color:var(--amber)">pysmith.py</span> → <span style="font-family:var(--mono)">PROVIDERS</span> if needed. Auto-test rounds: <span style="font-family:var(--mono)">AUTOTEST_MAX_ROUNDS</span>.</p>
+    <label style="display:flex;justify-content:space-between;align-items:center">
+      <span>Model</span>
+      <span id="refreshModels" style="cursor:pointer;color:var(--cyan);text-transform:none;letter-spacing:0;font-family:var(--ui);font-size:11px">↻ refresh from provider</span>
+    </label>
+    <select id="keyModel" class="provider-pick" style="width:100%;margin-bottom:6px"></select>
+    <p id="modelSourceNote" style="font-size:11px;color:var(--faint);margin:0 0 12px">&nbsp;</p>
+    <p style="font-size:12px">pysmith pulls the live model list from each provider using your key, so the dropdown shows exactly what your account can call. If a key is wrong, you'll see it here. Auto-test rounds: <span style="font-family:var(--mono)">AUTOTEST_MAX_ROUNDS</span>.</p>
     <div class="acts">
       <button class="btn ghost" id="settingsCancel">cancel</button>
       <button class="btn" id="settingsSave">save key</button>
@@ -847,7 +851,7 @@ async function converse(){
   }catch(e){ res = {error:"Could not reach the local server."}; }
   clearThinking(); state.busy=false; $("#sendBtn").disabled=false;
 
-  if(res.error){ addMsg("smith", "⚠ " + res.error); return; }
+  if(res.error){ addMsg("smith", fmtError(res)); return; }
   $("#modelName").textContent = res.model || $("#modelName").textContent;
   $("#modelDot").classList.add("on");
 
@@ -1373,7 +1377,7 @@ $("#clearLogBtn").onclick = async ()=>{
 
 // shared: apply a model result (used by fixlog) — mirrors converse()
 function applyModelResult(res, introIfProse){
-  if(res.error){ addMsg("smith","⚠ "+res.error); return; }
+  if(res.error){ addMsg("smith", fmtError(res)); return; }
   $("#modelName").textContent = res.model || $("#modelName").textContent;
   reflectKey(true);
   const {prose, code} = splitReply(res.reply);
@@ -1412,11 +1416,33 @@ function openSettings(){
 }
 function populateModels(pid){
   const p = _settingsProvs.find(x=>x.id===pid);
-  if(!p){ $("#keyModel").innerHTML=""; return; }
-  $("#keyModel").innerHTML = p.models.map((m,i)=>
+  const note = $("#modelSourceNote");
+  if(!p){ $("#keyModel").innerHTML=""; if(note) note.textContent="\u00a0"; return; }
+  $("#keyModel").innerHTML = (p.models||[]).map((m,i)=>
     `<option value="${escapeHtml(m)}" ${m===p.chosen?"selected":""}>${escapeHtml(m)}${i===0?"  (biggest)":""}</option>`
   ).join("");
+  if(note){
+    if(p.live) note.innerHTML = `<span style="color:var(--lime)">● live</span> — ${(p.models||[]).length} models from your ${escapeHtml(p.label)} key`;
+    else note.innerHTML = p.hasKey ? `<span style="color:var(--amber)">● fallback list</span> — hit ↻ refresh to pull your live models`
+                                   : `<span style="color:var(--faint)">add a key, then ↻ refresh for your live models</span>`;
+  }
 }
+// ↻ refresh: ask the provider directly what this key can call
+$("#refreshModels").onclick = async ()=>{
+  const provider = $("#keyProvider").value;
+  const note = $("#modelSourceNote");
+  if(note) note.textContent = "fetching live models…";
+  let r;
+  try{ r = await fetch("/api/models/refresh",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({provider})}).then(x=>x.json()); }
+  catch(e){ if(note) note.textContent="couldn't reach the server"; return; }
+  // update the cached provider entry and repaint
+  const p = _settingsProvs.find(x=>x.id===provider);
+  if(p && r.models){ p.models = r.models; p.chosen = r.models[0]; p.live = (r.source==="live"); }
+  populateModels(provider);
+  if(r.source==="live") toast(`Pulled ${r.models.length} models from ${p?p.label:provider}`);
+  else if(note) note.innerHTML = `<span style="color:var(--red)">couldn't fetch live list</span> — ${escapeHtml(r.error||"check the key")}`;
+};
 function updateKeyPlaceholder(provs, pid){
   const p = (provs||[]).find(x=>x.id===pid);
   $("#keyInput").placeholder = (p && p.hasKey) ? "A key is already saved — leave blank to keep it" : "paste key…";
@@ -1425,15 +1451,22 @@ $("#settingsCancel").onclick = ()=>$("#settingsScrim").classList.remove("on");
 $("#settingsSave").onclick = async ()=>{
   const key = $("#keyInput").value.trim();
   const provider = $("#keyProvider").value;
-  const model = $("#keyModel").value;
+  let model = $("#keyModel").value;
   const p = _settingsProvs.find(x=>x.id===provider);
-  // require a key only if this provider has none yet
   if(!key && !(p && p.hasKey)){ toast("Paste a key for this provider first", true); return; }
   try{
     if(key){
       const res = await fetch("/api/key",{method:"POST",headers:{"Content-Type":"application/json"},
         body:JSON.stringify({key, provider})}).then(r=>r.json());
       if(!res.hasKey){ toast("Key not accepted", true); return; }
+      // saving a key triggers a live model fetch server-side — reflect it
+      if(res.models){
+        if(p){ p.models=res.models; p.chosen=res.models[0]; p.live=(res.modelSource==="live"); }
+        populateModels(provider);
+        if(res.modelSource!=="live" && res.modelError){ toast("Key saved, but live model fetch failed: "+res.modelError, true); }
+        // if the pinned model isn't in the new list, clear the pin
+        if(model && !res.models.includes(model)) model = "";
+      }
     }
     if(model){
       await fetch("/api/model",{method:"POST",headers:{"Content-Type":"application/json"},
@@ -1468,6 +1501,14 @@ function esc(s){ return String(s==null?"":s).replace(/[&<>]/g,c=>({"&":"&amp;","
 // referenced but never defined, which threw ReferenceError and silently broke every
 // panel that rendered user/model text. It's the same job as esc(), so alias it.
 function escapeHtml(s){ return esc(s); }
+// Turn a server error response into a clear, friendly message. The context-overflow
+// case used to surface as a cryptic "model unavailable on your plan" — now it's plain.
+function fmtError(res){
+  if(res.error === "context_overflow"){
+    return "⚠ " + (res.detail || "This conversation got too long for the model. Start a new tool (＋ new tool) to reset — your library is safe.");
+  }
+  return "⚠ " + (res.detail ? res.error + " — " + res.detail : res.error);
+}
 let toastT;
 function toast(msg, bad){
   const el=$("#toast"); el.textContent=msg;

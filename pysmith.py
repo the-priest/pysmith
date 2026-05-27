@@ -54,11 +54,15 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # Keys are read from env vars (below) or pasted in Settings. Nothing is sent to
 # the browser; keys persist to an owner-only config file.
 #
-# >>> Edit model strings to match what your accounts actually have access to. <<<
+# The "models" lists below are only FALLBACKS. pysmith fetches each provider's
+# live catalog from its OpenAI-compatible /models endpoint ("models_url") using
+# your key, so the dropdown shows exactly what your account can actually call —
+# no more guessing at names that 404 with "model unavailable on your plan".
 PROVIDERS = {
     "groq": {
         "label": "Groq",
         "url": "https://api.groq.com/openai/v1/chat/completions",
+        "models_url": "https://api.groq.com/openai/v1/models",
         "env": "GROQ_API_KEY",
         "kind": "openai",
         "models": [
@@ -71,14 +75,17 @@ PROVIDERS = {
     },
     "siliconflow": {
         "label": "SiliconFlow",
-        "url": "https://api.siliconflow.com/v1/chat/completions",
+        # NOTE: the real host is api.siliconflow.cn (NOT .com). The .com host was the
+        # reason every SiliconFlow call failed before.
+        "url": "https://api.siliconflow.cn/v1/chat/completions",
+        "models_url": "https://api.siliconflow.cn/v1/models?sub_type=chat",
         "env": "SILICONFLOW_API_KEY",
         "kind": "openai",
-        # biggest / strongest first
+        # biggest / strongest first (fallback only — live fetch overrides)
         "models": [
             "deepseek-ai/DeepSeek-V3",
-            "Qwen/Qwen2.5-Coder-32B-Instruct",
             "Qwen/Qwen2.5-72B-Instruct",
+            "Qwen/Qwen2.5-Coder-32B-Instruct",
             "deepseek-ai/DeepSeek-V2.5",
             "Qwen/Qwen2.5-7B-Instruct",
         ],
@@ -86,6 +93,7 @@ PROVIDERS = {
     "google": {
         "label": "Google AI Studio",
         "url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+        "models_url": "https://generativelanguage.googleapis.com/v1beta/openai/models",
         "env": "GOOGLE_API_KEY",
         "kind": "openai",   # google exposes an OpenAI-compatible endpoint
         "models": [
@@ -99,6 +107,7 @@ PROVIDERS = {
     "novita": {
         "label": "Novita AI",
         "url": "https://api.novita.ai/v3/openai/chat/completions",
+        "models_url": "https://api.novita.ai/v3/openai/models",
         "env": "NOVITA_API_KEY",
         "kind": "openai",
         "models": [
@@ -295,6 +304,88 @@ STATE = {
 def persist_state():
     return save_config({"keys": STATE["keys"], "provider": STATE["provider"],
                         "models": STATE["models"]})
+
+# --------------------------------------------------------------------------
+# LIVE MODEL CATALOG  -- ask each provider what YOUR key can actually call
+# --------------------------------------------------------------------------
+# Cache of {provider_id: [model_id, ...]} fetched from each provider's /models
+# endpoint. Avoids the whole class of "model unavailable on your plan" errors that
+# come from hardcoded names drifting out of date.
+_MODEL_CACHE = {}
+
+# crude size ranking so "biggest first" still roughly holds for an unknown catalog
+def _model_rank(mid):
+    s = mid.lower()
+    score = 0
+    # explicit param-count hints
+    m = re.search(r"(\d+)\s*b\b", s) or re.search(r"-(\d+)b", s)
+    if m:
+        try: score += int(m.group(1))
+        except Exception: pass
+    # qualitative hints when there's no number
+    for kw, pts in (("pro", 300), ("max", 320), ("ultra", 340), ("405", 405), ("671", 671),
+                    ("flagship", 350), ("large", 200), ("70", 70), ("32", 32),
+                    ("coder", 40), ("instruct", 10),
+                    ("flash", -20), ("mini", -40), ("lite", -45), ("small", -50),
+                    ("8b", 8), ("7b", 7), ("3b", 3), ("1.5", -10)):
+        if kw in s: score += pts
+    return score
+
+def fetch_models(provider_id, force=False):
+    """Fetch the live list of chat models a provider exposes to this key.
+    Returns {"models": [...], "source": "live"|"fallback"|"error", "error": ...}."""
+    prov = PROVIDERS.get(provider_id)
+    if not prov:
+        return {"models": [], "source": "error", "error": "unknown provider"}
+    if not force and _MODEL_CACHE.get(provider_id):
+        return {"models": _MODEL_CACHE[provider_id], "source": "live"}
+    key = STATE.get("keys", {}).get(provider_id, "")
+    url = prov.get("models_url")
+    if not key or not url:
+        return {"models": list(prov["models"]), "source": "fallback",
+                "error": None if key else "no key yet"}
+    try:
+        req = urllib.request.Request(url, headers={
+            "Authorization": "Bearer " + key,
+            "User-Agent": f"pysmith/{__version__}",
+            "Accept": "application/json",
+        })
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = json.loads(resp.read().decode())
+        items = data.get("data", data if isinstance(data, list) else [])
+        ids = []
+        for it in items:
+            mid = it.get("id") if isinstance(it, dict) else str(it)
+            if not mid:
+                continue
+            low = mid.lower()
+            # keep chat/text LLMs only; drop embeddings/rerank/image/audio/video/tts/etc.
+            if any(b in low for b in ("embed", "rerank", "bge-", "whisper", "tts", "stt",
+                                      "stable-diffusion", "flux", "sdxl", "kolors", "cogvideo",
+                                      "wan-", "speech", "audio", "image", "video", "vl-",
+                                      "-vl", "vision", "ocr")):
+                continue
+            ids.append(mid)
+        if not ids:
+            return {"models": list(prov["models"]), "source": "fallback",
+                    "error": "no chat models returned"}
+        ids = sorted(set(ids), key=_model_rank, reverse=True)
+        _MODEL_CACHE[provider_id] = ids
+        return {"models": ids, "source": "live"}
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try: detail = e.read().decode(errors="replace")[:150]
+        except Exception: pass
+        msg = f"HTTP {e.code}"
+        if e.code == 401: msg = "key rejected (401) — check it in Settings"
+        elif e.code == 403: msg = "forbidden (403) — VPN/proxy or key issue"
+        return {"models": list(prov["models"]), "source": "fallback", "error": msg + (": "+detail if detail else "")}
+    except Exception as e:
+        return {"models": list(prov["models"]), "source": "fallback", "error": str(e)}
+
+def provider_model_chain(provider_id):
+    """The model order to try: live catalog if we have it, else the static fallback."""
+    return _MODEL_CACHE.get(provider_id) or list(PROVIDERS[provider_id]["models"])
 
 # --------------------------------------------------------------------------
 # TOOL LIBRARY  -- persistent, reloadable tools (code + conversation)
@@ -538,6 +629,72 @@ def _http_post(url, headers, body, timeout=120):
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode())
 
+# --------------------------------------------------------------------------
+# CONTEXT BUDGET  -- keep requests under the model's window on long sessions
+# --------------------------------------------------------------------------
+# Rough char budget for the whole message list sent to the model. ~4 chars/token,
+# so ~120k chars ≈ 30k tokens of input — comfortable for 32k+ context models while
+# leaving room for the reply. Tune if you pin a small-context model.
+CONTEXT_CHAR_BUDGET = 120_000
+
+def _msg_len(m):
+    return len(m.get("content", "") or "")
+
+def trim_history(messages):
+    """Keep a long build conversation under the context budget without losing what
+    matters. Strategy: ALWAYS keep the system prompt and the most recent messages;
+    ALWAYS keep the latest assistant turn that actually contains code (that's the
+    current tool); drop the stale middle, leaving a marker so the model knows.
+    This is the fix for 'it errors once the conversation gets big'."""
+    if not messages:
+        return messages
+    total = sum(_msg_len(m) for m in messages)
+    if total <= CONTEXT_CHAR_BUDGET:
+        return messages
+
+    system = [m for m in messages if m.get("role") == "system"]
+    body = [m for m in messages if m.get("role") != "system"]
+    sys_len = sum(_msg_len(m) for m in system)
+    budget = CONTEXT_CHAR_BUDGET - sys_len
+
+    # index of the last assistant message that carries a fenced code block — the
+    # current tool. We never want to drop that.
+    last_code_idx = None
+    for i in range(len(body) - 1, -1, -1):
+        if body[i].get("role") == "assistant" and "```" in (body[i].get("content") or ""):
+            last_code_idx = i
+            break
+
+    kept_tail = []
+    used = 0
+    # walk from the newest message backwards, keeping until we run out of budget
+    for i in range(len(body) - 1, -1, -1):
+        m = body[i]
+        L = _msg_len(m)
+        if used + L <= budget or not kept_tail:
+            kept_tail.append(m)
+            used += L
+        elif i == last_code_idx:
+            # force-keep the current tool even if it's older than the tail window,
+            # truncating it only if it alone blows the budget
+            content = m.get("content") or ""
+            if L > budget:
+                content = content[: max(2000, budget - 200)] + "\n# …(truncated by pysmith to fit context)…"
+            kept_tail.append({"role": m["role"], "content": content})
+            used += min(L, budget)
+        else:
+            continue
+    kept_tail.reverse()
+
+    dropped = len(body) - len([m for m in kept_tail])
+    marker = []
+    if dropped > 0:
+        marker = [{"role": "user", "content":
+                   f"(pysmith note: {dropped} earlier message(s) were trimmed to stay within the "
+                   f"model's context window. The current code and recent discussion are below; "
+                   f"treat the latest code block as the source of truth.)"}]
+    return system + marker + kept_tail
+
 def call_model(messages, provider_id=None):
     """Call the selected provider, falling through its model chain on error.
     Returns {"reply", "model", "provider"} or {"error"}."""
@@ -550,13 +707,17 @@ def call_model(messages, provider_id=None):
         return {"error": f"No API key for {prov['label']}. Add it in Settings, "
                          f"or set {prov['env']} and restart."}
 
-    # model order: a user-chosen model (if set) first, then the rest of the chain
+    # keep long build conversations within the model's context window
+    messages = trim_history(messages)
+
+    # model order: a user-chosen model (if set) first, then the rest of the LIVE chain
     chosen = STATE.get("models", {}).get(pid)
-    chain = list(prov["models"])
+    chain = provider_model_chain(pid)
     if chosen:
         chain = [chosen] + [m for m in chain if m != chosen]
 
     last = None
+    context_hit = False
     for model in chain:
         try:
             headers = {
@@ -570,20 +731,42 @@ def call_model(messages, provider_id=None):
             reply = data["choices"][0]["message"]["content"]
             return {"reply": reply, "model": model, "provider": pid}
         except urllib.error.HTTPError as e:
-            detail = e.read().decode(errors="replace")[:200]
+            detail = ""
+            try: detail = e.read().decode(errors="replace")[:400]
+            except Exception: pass
+            low = detail.lower()
+            # --- the conversation got too big for this model's context window ---
+            if (e.code in (400, 413) and any(s in low for s in (
+                    "context", "token", "maximum context", "too long", "context_length",
+                    "context length", "max_tokens", "reduce the length", "input is too long"))):
+                context_hit = True
+                last = f"{model}: context-window limit"
+                continue   # a smaller-context sibling won't help, but try in case limits differ
             if e.code == 403 and "1010" in detail:
                 return {"error": f"Blocked by Cloudflare (403/1010) before reaching "
                                  f"{prov['label']}. Usually a VPN/proxy or outdated client, not your key."}
             if e.code == 401:
-                return {"error": f"{prov['label']} rejected the key (401). Check it in Settings."}
+                return {"error": f"{prov['label']} rejected the key (401). Check it in Settings — "
+                                 f"and confirm you're using a {prov['label']} key, not another provider's."}
+            if e.code == 429:
+                return {"error": f"{prov['label']} rate-limited this request (429): "
+                                 f"{detail or 'slow down or check your quota'}."}
             if e.code in (404, 400):
-                # model not available to this account/plan — try the next in the chain
-                last = f"{model}: HTTP {e.code} (model unavailable on your plan?)"
+                # this specific model name isn't callable with your key — try the next
+                last = f"{model}: HTTP {e.code} (this model isn't available to your {prov['label']} key)"
                 continue
             last = f"{model}: HTTP {e.code} {detail}"
         except Exception as e:
             last = f"{model}: {e}"
-    return {"error": f"{prov['label']} chain failed. Last: {last}"}
+
+    if context_hit:
+        return {"error": "context_overflow",
+                "detail": "This conversation got too long for the model's context window. "
+                          "Start a new tool (＋ new tool) to reset — your saved work in the library "
+                          "is untouched — or trim the conversation. (pysmith already trims old turns "
+                          "automatically; a single huge tool can still exceed the limit.)"}
+    return {"error": f"{prov['label']} chain failed. Last: {last}. "
+                     f"Try Settings → refresh models, or pick a different model/provider."}
 
 def extract_code(reply):
     """Pull the python code block out of a model reply (tagged, else any fence)."""
@@ -1234,14 +1417,17 @@ class Handler(BaseHTTPRequestHandler):
             ctype = {"svg": "image/svg+xml", "png": "image/png"}.get(ext, "application/octet-stream")
             self._file(os.path.join(HERE, "assets", name), ctype)
         elif self.path == "/api/status":
-            provs = [{"id": pid, "label": p["label"],
-                      "hasKey": bool(STATE["keys"].get(pid)),
-                      "models": p["models"],
-                      "chosen": STATE["models"].get(pid) or p["models"][0],
-                      "topModel": p["models"][0]}
-                     for pid, p in PROVIDERS.items()]
-            cur = PROVIDERS.get(STATE["provider"], {})
-            chosen_cur = STATE["models"].get(STATE["provider"]) or (cur.get("models") or ["?"])[0]
+            provs = []
+            for pid, p in PROVIDERS.items():
+                chain = provider_model_chain(pid)   # live if cached, else fallback
+                provs.append({"id": pid, "label": p["label"],
+                              "hasKey": bool(STATE["keys"].get(pid)),
+                              "models": chain,
+                              "chosen": STATE["models"].get(pid) or (chain[0] if chain else "?"),
+                              "topModel": chain[0] if chain else "?",
+                              "live": pid in _MODEL_CACHE})
+            cur_chain = provider_model_chain(STATE["provider"])
+            chosen_cur = STATE["models"].get(STATE["provider"]) or (cur_chain[0] if cur_chain else "?")
             self._send(200, {
                 "providers": provs,
                 "provider": STATE["provider"],
@@ -1283,21 +1469,37 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {"error": "unknown provider"})
             STATE["keys"][pid] = (data.get("key") or "").strip()
             saved = persist_state() if STATE["keys"][pid] else False
-            self._send(200, {"hasKey": bool(STATE["keys"][pid]), "saved": saved})
+            # a new key means we can now ask the provider what it actually offers
+            fetched = None
+            if STATE["keys"][pid]:
+                _MODEL_CACHE.pop(pid, None)
+                fetched = fetch_models(pid, force=True)
+            self._send(200, {"hasKey": bool(STATE["keys"][pid]), "saved": saved,
+                             "models": (fetched or {}).get("models"),
+                             "modelSource": (fetched or {}).get("source"),
+                             "modelError": (fetched or {}).get("error")})
         elif self.path == "/api/provider":
             pid = data.get("provider")
             if pid not in PROVIDERS:
                 return self._send(200, {"error": "unknown provider"})
             STATE["provider"] = pid
             persist_state()
+            chain = provider_model_chain(pid)
             self._send(200, {"provider": pid, "hasKey": bool(STATE["keys"].get(pid)),
-                             "model": STATE["models"].get(pid) or PROVIDERS[pid]["models"][0]})
+                             "model": STATE["models"].get(pid) or (chain[0] if chain else "?")})
+        elif self.path == "/api/models/refresh":
+            pid = data.get("provider") or STATE["provider"]
+            if pid not in PROVIDERS:
+                return self._send(200, {"error": "unknown provider"})
+            self._send(200, {"provider": pid, **fetch_models(pid, force=True)})
         elif self.path == "/api/model":
             pid = data.get("provider") or STATE["provider"]
             model = data.get("model")
             if pid not in PROVIDERS:
                 return self._send(200, {"error": "unknown provider"})
-            if model and model in PROVIDERS[pid]["models"]:
+            # accept any model from the live catalog OR the static fallback
+            valid = set(provider_model_chain(pid)) | set(PROVIDERS[pid]["models"])
+            if model and model in valid:
                 STATE["models"][pid] = model
                 persist_state()
                 self._send(200, {"provider": pid, "model": model})
@@ -1418,6 +1620,13 @@ def main():
     have = [PROVIDERS[pid]["label"] for pid in PROVIDERS if STATE["keys"].get(pid)]
     if have:
         print(f"  keys loaded for: {', '.join(have)}")
+        # fetch each keyed provider's live model catalog in the background so the
+        # dropdown is accurate without blocking startup
+        def _warm():
+            for pid in PROVIDERS:
+                if STATE["keys"].get(pid):
+                    fetch_models(pid, force=True)
+        threading.Thread(target=_warm, daemon=True).start()
     else:
         print(f"  no API keys yet \u2014 add one in Settings")
     print(f"  active provider: {PROVIDERS[STATE['provider']]['label']}")

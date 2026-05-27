@@ -123,11 +123,17 @@ real tools), so take the review step seriously.
 
 Top of `pysmith.py`:
 
-- **`PROVIDERS`** — the providers pysmith can call (Anthropic, OpenAI, Groq) and the
-  model chain for each, biggest → smallest. You pick the active one per session from the
-  dropdown in the app; a failed call falls through that provider's chain. Edit the model
-  strings to match what your accounts actually have access to.
+- **`PROVIDERS`** — the providers pysmith can call (Groq, SiliconFlow, Google AI Studio,
+  Novita) and a fallback model chain for each. You pick the active one per session from the
+  dropdown; a failed call falls through that provider's chain. **You normally don't edit the
+  model lists** — pysmith fetches each provider's *live* catalog from its `/models` endpoint
+  using your key, so the model dropdown shows exactly what your account can call. Hit
+  **↻ refresh from provider** in Settings any time, or just save a key and it refreshes
+  automatically. The hardcoded lists are only fallbacks for when a provider is unreachable.
 - **`DEFAULT_PROVIDER`** — which provider is active on first launch.
+- **`CONTEXT_CHAR_BUDGET`** — long build conversations are automatically trimmed to stay under
+  the model's context window (system prompt + current code + recent turns are always kept), so
+  a big session doesn't start erroring. Raise it for big-context models, lower it for small ones.
 - **`AUTOTEST_MAX_ROUNDS`** — after the model writes code, pysmith silently syntax-checks it,
   verifies it's **import-safe** (a GUI tool must not open its window at import time), and
   smoke-imports it, feeding failures back to the model up to this many times *before you see
@@ -138,9 +144,9 @@ Top of `pysmith.py`:
 - **`DANGER`** — the destructive-pattern tripwires.
 - **`PORT`** — default `8765` (auto-bumps if taken).
 
-Keys are read from each provider's env var (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
-`GROQ_API_KEY`) or pasted per-provider in Settings, then persisted to an owner-only
-config file at `~/.config/pysmith/config.json`.
+Keys are read from each provider's env var (`GROQ_API_KEY`, `SILICONFLOW_API_KEY`,
+`GOOGLE_API_KEY`, `NOVITA_API_KEY`) or pasted per-provider in Settings, then persisted to an
+owner-only config file at `~/.config/pysmith/config.json`.
 
 
 ---
