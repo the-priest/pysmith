@@ -249,6 +249,27 @@
   .patts{font-family:var(--mono);font-size:12px;color:var(--red);background:rgba(224,89,74,.08);
     border:1px solid rgba(224,89,74,.25);border-radius:8px;padding:9px 11px;margin-bottom:14px}
   .modal.gh{width:520px}
+  .modal.review{width:560px}
+  #reviewBody{max-height:60vh;overflow-y:auto;margin-bottom:14px}
+  .review-loading{color:var(--dim);font-size:13px;padding:18px 0;text-align:center}
+  .review-verdict{font-size:14px;color:var(--ink);background:var(--bg);border:1px solid var(--line);
+    border-left:3px solid var(--amber);border-radius:8px;padding:11px 13px;margin-bottom:14px;line-height:1.5}
+  .review-issue{border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin-bottom:8px;background:var(--bg)}
+  .review-issue.high{border-left:3px solid var(--red)}
+  .review-issue.medium{border-left:3px solid var(--amber)}
+  .review-issue.low{border-left:3px solid var(--steel)}
+  .review-issue .sev{font-family:var(--mono);font-size:9px;letter-spacing:.1em;text-transform:uppercase;
+    padding:1px 6px;border-radius:4px;margin-right:7px}
+  .review-issue.high .sev{color:var(--red);background:rgba(224,89,74,.12)}
+  .review-issue.medium .sev{color:var(--amber);background:rgba(232,163,61,.12)}
+  .review-issue.low .sev{color:var(--steel);background:rgba(120,140,160,.12)}
+  .review-issue .ttl{font-weight:600;font-size:13px;color:var(--ink)}
+  .review-issue .ln{font-family:var(--mono);font-size:11px;color:var(--faint);margin-left:6px}
+  .review-issue .det{font-size:12px;color:var(--dim);margin-top:5px;line-height:1.5}
+  .review-strengths{font-size:12px;color:var(--lime);margin-top:10px}
+  .review-strengths li{margin:3px 0}
+  .review-clean{color:var(--lime);font-size:14px;text-align:center;padding:14px 0}
+  .review-engine{font-family:var(--mono);font-size:10px;color:var(--faint);margin-top:10px;text-align:right}
   .gh-row{display:flex;gap:12px}.gh-row>div{flex:1}
   .gh-https{font-size:12px;color:var(--lime)}
   .gh-files{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:14px}
@@ -409,6 +430,7 @@
           <span class="fname" id="codeFile">no draft yet</span>
           <div class="acts">
             <button class="btn ghost" id="diffBtn" disabled title="Show what changed in the last version">⇄ diff</button>
+            <button class="btn ghost" id="reviewBtn" disabled title="AI + static analysis review of the whole tool (finds clashes, bugs, risks)">🔍 review</button>
             <button class="btn ghost" id="editBtn" disabled title="Edit the code yourself">✎ edit</button>
             <button class="btn ghost" id="depsBtn" disabled title="Detect &amp; install third-party packages">⬇ deps</button>
             <button class="btn ghost" id="copyBtn" disabled>⧉ copy</button>
@@ -498,6 +520,20 @@
     <div class="acts">
       <button class="btn ghost" id="dangerCancel">cancel</button>
       <button class="btn run" id="dangerConfirm">run anyway</button>
+    </div>
+  </div>
+</div>
+
+<!-- review modal -->
+<div class="scrim" id="reviewScrim">
+  <div class="modal review">
+    <h3>🔍 Code review</h3>
+    <div id="reviewBody">
+      <div class="review-loading">Analyzing the whole tool…</div>
+    </div>
+    <div class="acts">
+      <button class="btn ghost" id="reviewClose">close</button>
+      <button class="btn" id="reviewFix" style="display:none" title="Ask the AI to fix the issues found">⮐ fix these issues</button>
     </div>
   </div>
 </div>
@@ -900,7 +936,7 @@ function loadCode(code){
   $("#fileName").textContent = state.name + ".py";
   renderCode(code);
   ["copyBtn","saveBtn","runBtn","releaseBtn","fixLogBtn","polishBtn","dlLogBtn","clearLogBtn",
-   "editBtn","depsBtn","libSaveBtn"].forEach(id=>$("#"+id).disabled=false);
+   "editBtn","depsBtn","libSaveBtn","reviewBtn"].forEach(id=>$("#"+id).disabled=false);
   $("#diffBtn").disabled = !state.prevCode;
   autosaveSession();   // a tool exists now → persist the work-in-progress
 }
@@ -972,6 +1008,68 @@ function renderDiff(a, b){
   body.innerHTML = html;
   $("#diffClose").onclick = ()=>renderCode(state.code);
 }
+
+// ---------- review (feature #2): AI + static analysis of the whole tool ----------
+$("#reviewBtn").onclick = async ()=>{
+  if(!state.code) return;
+  $("#reviewScrim").classList.add("on");
+  $("#reviewFix").style.display = "none";
+  $("#reviewBody").innerHTML = `<div class="review-loading">Analyzing the whole tool — static analysis + AI review…</div>`;
+  let r;
+  try{
+    r = await fetch("/api/review",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({code:state.code})}).then(x=>x.json());
+  }catch(e){
+    $("#reviewBody").innerHTML = `<div class="review-issue high"><span class="ttl">Couldn't reach the local server</span><div class="det">Is pysmith still running in your terminal?</div></div>`;
+    return;
+  }
+  renderReview(r);
+};
+function renderReview(r){
+  const body = $("#reviewBody");
+  if(r.error){
+    body.innerHTML = `<div class="review-issue medium"><span class="ttl">${escapeHtml(r.error)}</span></div>`;
+    return;
+  }
+  let html = "";
+  if(r.verdict) html += `<div class="review-verdict">${escapeHtml(r.verdict)}</div>`;
+  const issues = r.issues || [];
+  if(!issues.length){
+    html += `<div class="review-clean">✓ No issues found — this tool looks solid.</div>`;
+  }else{
+    issues.forEach(it=>{
+      const sev = (it.severity||"medium").toLowerCase();
+      const ln = it.line ? `<span class="ln">line ${escapeHtml(String(it.line))}</span>` : "";
+      html += `<div class="review-issue ${sev}">
+        <span class="sev">${escapeHtml(sev)}</span><span class="ttl">${escapeHtml(it.title||"issue")}</span>${ln}
+        <div class="det">${escapeHtml(it.detail||"")}</div></div>`;
+    });
+  }
+  if(r.strengths && r.strengths.length){
+    html += `<div class="review-strengths"><b>Strengths:</b><ul>` +
+      r.strengths.map(s=>`<li>${escapeHtml(s)}</li>`).join("") + `</ul></div>`;
+  }
+  html += `<div class="review-engine">analysis: ${escapeHtml(r.engine||"ast")}${r.model?" · model: "+escapeHtml(String(r.model).split("/").pop()):""}</div>`;
+  body.innerHTML = html;
+  // offer a one-click fix when real issues exist
+  const fixable = issues.filter(i=>(i.severity||"").toLowerCase()!=="low");
+  if(fixable.length){
+    const btn = $("#reviewFix");
+    btn.style.display = "inline-flex";
+    btn._issues = issues;
+    btn._verdict = r.verdict;
+  }
+}
+$("#reviewClose").onclick = ()=>$("#reviewScrim").classList.remove("on");
+$("#reviewFix").onclick = async ()=>{
+  const btn = $("#reviewFix");
+  const issues = btn._issues || [];
+  $("#reviewScrim").classList.remove("on");
+  // turn the review into a concrete fix request and send it through the normal build path
+  const list = issues.map(i=>`- [${(i.severity||"").toUpperCase()}] ${i.title}: ${i.detail}${i.line?` (line ${i.line})`:""}`).join("\n");
+  const msg = `Please fix these issues found in a code review of the current tool, and return the FULL corrected script:\n\n${list}`;
+  send(msg);
+};
 
 // ---------- editable code pane ----------
 $("#editBtn").onclick = ()=>{
@@ -1491,7 +1589,7 @@ $("#newBtn").onclick = ()=>{
   state.prevCode=null;
   state.sessionId=null;
   ["copyBtn","saveBtn","runBtn","releaseBtn","fixLogBtn","polishBtn","dlLogBtn","clearLogBtn",
-   "editBtn","diffBtn","depsBtn","libSaveBtn"].forEach(id=>$("#"+id).disabled=true);
+   "editBtn","diffBtn","depsBtn","libSaveBtn","reviewBtn"].forEach(id=>$("#"+id).disabled=true);
   greet();
 };
 

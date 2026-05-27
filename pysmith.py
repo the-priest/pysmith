@@ -39,7 +39,7 @@ import urllib.request
 import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-__version__ = "9.1.0"
+__version__ = "9.2.0"
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 # ==========================================================================
@@ -258,6 +258,32 @@ README requirements:
 For "apt": detect the toolkit from the code. gi/PyGObject GTK3 -> "python3-gi gir1.2-gtk-3.0";
 GTK4 -> "python3-gi gir1.2-gtk-4.0"; libadwaita -> add "gir1.2-adw-1"; PyQt5 -> "python3-pyqt5";
 PySide6 -> "python3-pyside6"; tkinter -> "python3-tk". Empty string only if pure stdlib with no GUI."""
+
+# Used by the "review my code" button: a focused critique that DIAGNOSES, never rewrites.
+REVIEW_PROMPT = """You are a senior Python/GUI engineer doing a careful code review of a single-file
+tool that runs on Kali (GTK/PyQt/Tkinter). You are given the FULL code and, separately, the findings
+of an automated static analyzer. Your job is to REVIEW, not rewrite — do NOT output a corrected
+script.
+
+Look hard for things that will actually bite the user:
+- logic errors and clashes: functions called with wrong/!args, methods that don't exist on the
+  object, signals/callbacks wired to handlers that aren't defined, variables used before assignment
+- GUI-specific problems: blocking work on the main thread (freezes the window), missing
+  GLib.idle_add / signals when updating the UI from a thread, windows that won't fit a narrow Phosh
+  screen, missing graceful handling when a Kali binary or the toolkit is absent
+- correctness: unhandled error paths, resource leaks, race conditions, off-by-one, wrong defaults
+- dead or contradictory code, and anything that simply won't do what it claims
+
+Return ONLY a JSON object, no prose, no fences:
+{"verdict": "<one short sentence: is it solid, or does it need work?>",
+ "issues": [
+   {"severity": "high|medium|low", "title": "<short>", "detail": "<what's wrong and why it matters>",
+    "line": <line number or null>}
+ ],
+ "strengths": ["<one or two things done well>"]}
+
+Be specific and honest. If it's genuinely clean, say so with an empty issues list — do not invent
+problems. Order issues high severity first. Cap at the ~8 most important."""
 
 DANGER = [
     r"rm\s+-rf\s+/", r":\(\)\s*\{", r"shutil\.rmtree\(\s*['\"]/", r"\bmkfs\b",
@@ -1283,19 +1309,32 @@ def chat_with_autotest(messages, provider_id=None):
             res["autotest"] = {"ran": False, "rounds": rounds}
             return res
         passed, report, checks = smoke_test(code)
+        # also surface any non-fatal analysis notes (minor findings) for visibility
+        minor = [note for name, ok, note in checks if name == "analysis" and ok and note
+                 and ("minor only" in note)]
         rounds.append({"attempt": attempt + 1, "passed": passed,
                        "checks": [c[0] for c in checks if c[1]],
                        "failed": [c[0] for c in checks if not c[1]],
-                       "report": "" if passed else report})
+                       "report": "" if passed else report,
+                       "minor": minor})
         if passed or attempt == AUTOTEST_MAX_ROUNDS:
             res["autotest"] = {"ran": True, "passed": passed, "rounds": rounds}
             return res
-        # feed the failure back and retry silently
+        # FEED THE FAILURE BACK with a structural map so the fix is informed, not blind.
+        # Giving the model a map of its own code + the exact analyzer findings produces a
+        # far better fix than just "it failed, try again" (the agentic-loop pattern).
+        cmap = code_map(code)
+        fix_msg = (f"Your code failed an automatic quality check before I saw it. "
+                   f"Fix the SPECIFIC problems below and return the FULL corrected script "
+                   f"(one ```python block, nothing omitted).\n\n"
+                   f"=== problems found ===\n{report}\n")
+        if cmap:
+            fix_msg += f"\n=== structure of the code you just wrote (keep calls consistent) ===\n{cmap}\n"
+        fix_msg += ("\nDo not introduce new problems. Re-check that every function is called with "
+                    "the right arguments and every name is defined before use.")
         convo = convo + [
             {"role": "assistant", "content": res["reply"]},
-            {"role": "user", "content":
-                f"Your code failed an automatic check before I saw it. Fix it and return the "
-                f"FULL corrected script.\n\nCheck output:\n{report}"},
+            {"role": "user", "content": fix_msg},
         ]
         nxt = call_model(convo, provider_id)
         if nxt.get("error"):
@@ -1303,6 +1342,42 @@ def chat_with_autotest(messages, provider_id=None):
                                "note": "auto-fix call failed: " + nxt["error"]}
             return res
         res = nxt
+
+def review_code(code, provider_id=None):
+    """Feature #2 — the 'review my code' button. Runs the independent static analyzer,
+    then asks the model for a focused critique (diagnose, don't rewrite). Returns a
+    structured report the UI renders. Never modifies the code."""
+    if not code or not code.strip():
+        return {"error": "There's no code to review yet."}
+    # 1. independent static analysis first — concrete, model-blind findings
+    analysis = analyze_code(code)
+    analyzer_block = ("Automated static analysis: no issues found."
+                      if analysis["clean"]
+                      else "Automated static analysis (" + analysis["engine"] + ") found:\n- "
+                           + "\n- ".join(analysis["issues"]))
+    # 2. ask the model to review, given the code + the analyzer's findings
+    res = call_model([
+        {"role": "system", "content": REVIEW_PROMPT},
+        {"role": "user", "content":
+            f"Here is the tool to review:\n```python\n{code}\n```\n\n{analyzer_block}"},
+    ], provider_id)
+    if res.get("error"):
+        return res
+    parsed = _parse_json_reply(res.get("reply", ""))
+    if not parsed:
+        # graceful fallback: hand back the analyzer findings even if the model's
+        # JSON didn't parse, so the button still does something useful.
+        return {"verdict": "Automated checks only (model review unavailable).",
+                "issues": [{"severity": "medium", "title": i.split(":")[0] if ":" in i else "issue",
+                            "detail": i, "line": None} for i in analysis["issues"]],
+                "strengths": [], "engine": analysis["engine"],
+                "model": res.get("model")}
+    parsed["engine"] = analysis["engine"]
+    parsed["model"] = res.get("model")
+    # make sure the concrete analyzer findings aren't lost if the model overlooked them
+    if not analysis["clean"]:
+        parsed.setdefault("analyzer_findings", analysis["issues"])
+    return parsed
 
 def _parse_json_reply(reply):
     """Extract a JSON object from a model reply, tolerating fences/prose."""
@@ -1926,6 +2001,8 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/api/fixlog":
             convo = data.get("messages", [])
             self._send(200, fix_from_log(data.get("code", ""), convo, data.get("provider")))
+        elif self.path == "/api/review":
+            self._send(200, review_code(data.get("code", ""), data.get("provider")))
         elif self.path == "/api/intake":
             self._send(200, make_intake(data.get("request", ""), data.get("provider")))
         elif self.path == "/api/github":
