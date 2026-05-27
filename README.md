@@ -137,12 +137,19 @@ Top of `pysmith.py`:
 - **`AUTOTEST_MAX_ROUNDS`** — after the model writes code, pysmith silently syntax-checks it,
   verifies it's **import-safe** (a GUI tool must not open its window at import time), smoke-imports
   it, and runs a **whole-code analysis pass** that catches clashes the model can't see in its own
-  output — undefined names, calls with the wrong number of arguments, dead variables. It uses
-  **Ruff** if installed (faster, deeper) and falls back to a built-in `ast` analyzer otherwise, so
-  it stays zero-dependency. Real correctness issues are fed back to the model to fix, up to this
-  many times *before you see the code*. Before each edit, the model is also handed a compact
-  **structural map** of the current tool (its classes, methods, and function signatures) so it
-  keeps calls consistent and stops re-introducing bugs. This is the main quality lever.
+  output — undefined/hallucinated names, calls with the wrong number of arguments (including a class
+  calling **its own `self.method()`** with the wrong arity, the bug that creeps in after a refactor),
+  and dead variables. It uses **Ruff** if installed (faster, deeper) and otherwise falls back to a
+  built-in `ast` analyzer that does the same core checks, so it stays zero-dependency. The built-in
+  analyzer favours **precision over recall** — it would rather miss a subtle bug than flag correct
+  code and send the model off to "fix" something that was already right. When Ruff *is* present,
+  pysmith also runs a **lint-and-fix pass**: trivial, behaviour-safe issues (a stray unused variable,
+  a redundant f-string prefix) are auto-corrected in place so they never cost a fix round (import
+  removal and redefinition rewrites are excluded — those can change intent). Real correctness issues
+  are fed back to the model to fix, up to this many times *before you see the code*. Before each edit,
+  the model is also handed a compact **structural map** of the current tool (its classes, methods,
+  and function signatures) so it keeps calls consistent and stops re-introducing bugs. This is the
+  main quality lever.
 - **`SYSTEM_PROMPT`** — the tool-building method. Tighten to taste.
 - **`DANGER`** — the destructive-pattern tripwires.
 - **`PORT`** — default `8765` (auto-bumps if taken).

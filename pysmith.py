@@ -39,7 +39,7 @@ import urllib.request
 import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-__version__ = "9.2.1"
+__version__ = "9.3.0"
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 # ==========================================================================
@@ -286,9 +286,10 @@ Be specific and honest. If it's genuinely clean, say so with an empty issues lis
 problems. Order issues high severity first. Cap at the ~8 most important."""
 
 DANGER = [
-    r"rm\s+-rf\s+/", r":\(\)\s*\{", r"shutil\.rmtree\(\s*['\"]/", r"\bmkfs\b",
-    r"dd\s+if=", r"os\.system\(\s*['\"]\s*rm\b", r">\s*/dev/sd", r"\bfork\(\)\s*while",
-    r"shutil\.rmtree\(\s*os\.path\.expanduser",
+    r"rm\s+-rf\s+/", r"rm\s+-rf\s+~", r"rm\s+-rf\s+\$HOME", r"rm\s+-rf\s+\*",
+    r":\(\)\s*\{", r"shutil\.rmtree\(\s*['\"]/", r"\bmkfs\b",
+    r"dd\s+if=", r"\bof=/dev/sd", r"os\.system\(\s*['\"]\s*rm\b", r">\s*/dev/sd",
+    r"os\.fork\s*\(\)", r"shutil\.rmtree\(\s*os\.path\.expanduser",
 ]
 
 # key persistence: per-provider keys in an owner-only config file
@@ -938,8 +939,8 @@ def call_model(messages, provider_id=None):
                                 continue
                 return {"error": f"{prov['label']} rejected the key (401). Check it in Settings — "
                                  f"and confirm you're using a {prov['label']} key, not another provider's."
-                                 + (f" For SiliconFlow, the key must be from the same site as the "
-                                    f"endpoint (cloud.siliconflow.com ↔ api.siliconflow.com)."
+                                 + (" For SiliconFlow, the key must be from the same site as the "
+                                    "endpoint (cloud.siliconflow.com \u2194 api.siliconflow.com)."
                                     if pid == "siliconflow" else "")}
             if e.code == 429:
                 return {"error": f"{prov['label']} rate-limited this request (429): "
@@ -969,6 +970,20 @@ def extract_code(reply):
     m = re.search(r"```(?:python|py)\s*\n(.*?)```", reply, re.S | re.I) \
         or re.search(r"```\s*\n(.*?)```", reply, re.S)
     return m.group(1).rstrip() if m else None
+
+def replace_first_code_block(reply, new_code):
+    """Swap the body of the first python/py fenced block (or any fenced block) in a
+    reply with new_code, preserving the surrounding prose. Mirrors extract_code's
+    block selection so the swapped block is the same one the rest of the app reads.
+    Returns the rewritten reply, or the original if no fenced block is present."""
+    nc = new_code.rstrip()
+    def _do(m):
+        return m.group(1) + nc + "\n" + m.group(3)
+    for pat in (re.compile(r"(```(?:python|py)\s*\n)(.*?)(```)", re.S | re.I),
+                re.compile(r"(```\s*\n)(.*?)(```)", re.S)):
+        if pat.search(reply):
+            return pat.sub(_do, reply, count=1)
+    return reply
 
 # --------------------------------------------------------------------------
 # WHOLE-CODE ANALYSIS  -- catch clashes the model can't see in its own output
@@ -1018,14 +1033,60 @@ def analyze_with_ruff(code):
         try: os.unlink(path)
         except Exception: pass
 
+def autofix_with_ruff(code):
+    """The 'lint-and-fix' loop every serious AI coding tool runs (aider, etc.):
+    if Ruff is present, silently apply its SAFE auto-fixes to generated code before
+    the user ever sees it. Only fixes that cannot change behaviour are applied —
+    things like a stray unused variable or a redundant f-string prefix — so the
+    model never burns a whole fix-round on trivial mechanical cleanup. Import
+    removal (F401) and redefinition rewrites (F811) are deliberately EXCLUDED, as
+    those can touch import side-effects or intent. Returns (code, [rule_ids fixed]);
+    a no-op returning the code unchanged when Ruff is absent or nothing is fixable."""
+    ruff = _ruff_path()
+    if not ruff:
+        return code, []
+    fd, path = tempfile.mkstemp(prefix="pysmith_fix_", suffix=".py")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(code)
+        sel = ["--select", "F,E9", "--ignore", "F401,F811", "--no-cache"]
+        before = subprocess.run([ruff, "check", *sel, "--output-format", "json", path],
+                                capture_output=True, text=True, timeout=20)
+        try:
+            items = json.loads(before.stdout or "[]")
+        except Exception:
+            items = []
+        fixable = sorted({it.get("code") for it in items
+                          if (it.get("fix") or {}).get("applicability") == "safe" and it.get("code")})
+        if not fixable:
+            return code, []
+        subprocess.run([ruff, "check", *sel, "--fix", path], capture_output=True, text=True, timeout=20)
+        with open(path) as f:
+            fixed = f.read().rstrip()
+        # only accept the fix if it still parses (paranoia — ruff safe fixes always do)
+        try:
+            import ast as _ast; _ast.parse(fixed)
+        except SyntaxError:
+            return code, []
+        return (fixed or code), fixable
+    except Exception:
+        return code, []
+    finally:
+        try: os.unlink(path)
+        except Exception: pass
+
 def analyze_with_ast(code):
-    """Built-in fallback analyzer. Walks the AST to catch the highest-value clashes
-    without any third-party dependency:
-      - calls to a locally-defined function with the wrong number of positional args
-      - use of a name that is never defined/imported/built-in (likely typo or clash)
-      - local variables assigned but never used
-    Conservative by design: when in doubt it stays silent, to avoid false alarms that
-    would make the model 'fix' correct code."""
+    """Built-in, zero-dependency fallback analyzer. Walks the AST to catch the
+    highest-value clashes a model can't see in its own output:
+      - use of a name that is bound NOWHERE in the file (typo / hallucinated name)
+      - calls to a top-level function with the wrong number of positional args
+      - calls to a class's OWN method (self.method(...)) with the wrong arity
+      - local variables assigned a side-effect-free value but never used
+    Precision over recall: it deliberately over-collects 'bound names' (scope-
+    insensitively) so it will essentially never flag a name that is legitimately
+    defined somewhere — at the cost of missing a few real bugs. Staying silent on
+    correct code matters more here than catching everything, because a false alarm
+    makes the model 'fix' code that was already right."""
     import ast, builtins
     issues = []
     try:
@@ -1033,53 +1094,134 @@ def analyze_with_ast(code):
     except SyntaxError as e:
         return [f"L{e.lineno} syntax: {e.msg}"]
 
-    builtin_names = set(dir(builtins))
-    # names brought in by imports (so we don't flag them as undefined)
-    imported = set()
-    # top-level function signatures, for arity checking
-    func_sigs = {}      # name -> (min_args, max_args_or_None_for_varargs)
-    defined_top = set() # top-level def/class/assignment names
+    # ---- collect EVERY name bound anywhere in the module (scope-insensitive) ----
+    # If the file does `from x import *` we can't know what it pulls in, so the
+    # undefined-name check is skipped entirely rather than risk false positives.
+    star_import = False
+    bound = set()       # every name assigned / defined / imported / used as a param
+
+    def _bind_target(t):
+        # record names bound by an assignment/loop/with target (incl. tuple unpacking)
+        if isinstance(t, ast.Name):
+            bound.add(t.id)
+        elif isinstance(t, (ast.Tuple, ast.List)):
+            for e in t.elts:
+                _bind_target(e)
+        elif isinstance(t, ast.Starred):
+            _bind_target(t.value)
+        # attribute/subscript targets (self.x = …, d[k] = …) bind no bare name
+
+    def _bind_args(a):
+        for grp in (getattr(a, "posonlyargs", []), a.args, a.kwonlyargs):
+            for arg in grp:
+                bound.add(arg.arg)
+        if a.vararg: bound.add(a.vararg.arg)
+        if a.kwarg:  bound.add(a.kwarg.arg)
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for a in node.names:
-                imported.add((a.asname or a.name).split(".")[0])
+                bound.add((a.asname or a.name).split(".")[0])
         elif isinstance(node, ast.ImportFrom):
             for a in node.names:
-                imported.add(a.asname or a.name)
-
-    for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            defined_top.add(node.name)
-            args = node.args
-            posonly = getattr(args, "posonlyargs", [])
-            pos = len(posonly) + len(args.args)
-            ndef = len(args.defaults)
-            has_var = args.vararg is not None or args.kwarg is not None or bool(args.kwonlyargs)
-            func_sigs[node.name] = (pos - ndef, None if has_var else pos)
+                if a.name == "*":
+                    star_import = True
+                else:
+                    bound.add(a.asname or a.name)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            bound.add(node.name); _bind_args(node.args)
+        elif isinstance(node, ast.Lambda):
+            _bind_args(node.args)
         elif isinstance(node, ast.ClassDef):
-            defined_top.add(node.name)
+            bound.add(node.name)
         elif isinstance(node, ast.Assign):
             for t in node.targets:
-                if isinstance(t, ast.Name):
-                    defined_top.add(t.id)
+                _bind_target(t)
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+            _bind_target(node.target)
+        elif isinstance(node, ast.NamedExpr):                 # walrus  (x := …)
+            _bind_target(node.target)
+        elif isinstance(node, (ast.For, ast.AsyncFor)):
+            _bind_target(node.target)
+        elif isinstance(node, ast.comprehension):
+            _bind_target(node.target)
+        elif isinstance(node, ast.withitem):
+            if node.optional_vars is not None:
+                _bind_target(node.optional_vars)
+        elif isinstance(node, ast.ExceptHandler):
+            if node.name:
+                bound.add(node.name)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            for n in node.names:
+                bound.add(n)
+        elif node.__class__.__name__ in ("MatchAs", "MatchStar") and getattr(node, "name", None):
+            bound.add(node.name)                              # match … as name (3.10+)
 
-    # --- arity check: direct calls to a top-level function by bare name ---
+    builtin_names = set(dir(builtins)) | {
+        "__name__", "__file__", "__doc__", "__builtins__", "__spec__", "__class__",
+        "__loader__", "__package__", "__path__", "self", "cls",
+    }
+    allowed = bound | builtin_names
+
+    # ---- undefined names: a Load-context bare name bound NOWHERE and not built-in ----
+    if not star_import:
+        seen_undef = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+                nm = node.id
+                if nm not in allowed and nm not in seen_undef:
+                    seen_undef.add(nm)
+                    issues.append(f"L{node.lineno} undefined: name '{nm}' is used but never "
+                                  f"defined, imported, or built-in (typo or missing definition?)")
+
+    # ---- arity helpers ----
+    def _sig(fnnode, drop_first=False):
+        a = fnnode.args
+        posonly = getattr(a, "posonlyargs", [])
+        pos = len(posonly) + len(a.args) - (1 if drop_first else 0)
+        ndef = len(a.defaults)
+        has_var = a.vararg is not None or a.kwarg is not None or bool(a.kwonlyargs)
+        return (max(0, pos - ndef), None if has_var else max(0, pos))
+
+    def _check_call(label, mn, mx, callnode):
+        # skip calls using *args/**kwargs — too dynamic to judge
+        if any(isinstance(a, ast.Starred) for a in callnode.args) or \
+           any(k.arg is None for k in callnode.keywords):
+            return
+        nargs = len(callnode.args) + len(callnode.keywords)
+        ln = getattr(callnode, "lineno", "?")
+        if mx is not None and nargs > mx:
+            issues.append(f"L{ln} call: {label}() called with {nargs} args but takes at most {mx}")
+        elif nargs < mn:
+            issues.append(f"L{ln} call: {label}() called with {nargs} args but needs at least {mn}")
+
+    # --- arity: direct calls to an UNDECORATED top-level function by bare name ---
+    # (a decorator can change a function's effective signature, so we skip those.)
+    func_sigs = {}
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and not node.decorator_list:
+            func_sigs[node.name] = _sig(node)
     for node in ast.walk(tree):
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-            fn = node.func.id
-            if fn in func_sigs:
-                # skip calls using *args/**kwargs — too dynamic to judge
-                if any(isinstance(a, ast.Starred) for a in node.args) or \
-                   any(k.arg is None for k in node.keywords):
-                    continue
-                mn, mx = func_sigs[fn]
-                nargs = len(node.args) + len(node.keywords)
-                ln = getattr(node, "lineno", "?")
-                if mx is not None and nargs > mx:
-                    issues.append(f"L{ln} call: {fn}() called with {nargs} args but takes at most {mx}")
-                elif nargs < mn:
-                    issues.append(f"L{ln} call: {fn}() called with {nargs} args but needs at least {mn}")
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in func_sigs:
+            mn, mx = func_sigs[node.func.id]
+            _check_call(node.func.id, mn, mx, node)
+
+    # --- arity: self.method(...) calls vs methods defined in the SAME class ---
+    # We know the real signature regardless of base classes, so this is safe even
+    # for tools that subclass Gtk.Window / QWidget / tk.Frame. Decorated methods
+    # (static/class/property/custom) are skipped — their call shape can differ.
+    for cls in (n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)):
+        methods = {}
+        for b in cls.body:
+            if isinstance(b, (ast.FunctionDef, ast.AsyncFunctionDef)) and not b.decorator_list:
+                methods[b.name] = _sig(b, drop_first=True)
+        for node in ast.walk(cls):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "self"
+                    and node.func.attr in methods):
+                mn, mx = methods[node.func.attr]
+                _check_call("self." + node.func.attr, mn, mx, node)
 
     # --- unused local variables (per-function, conservative) ---
     # GUI code constantly assigns the result of a call for its side effects
@@ -1338,6 +1480,13 @@ def chat_with_autotest(messages, provider_id=None):
         if not code:
             res["autotest"] = {"ran": False, "rounds": rounds}
             return res
+        # lint-and-fix loop: silently apply Ruff's SAFE mechanical fixes so trivial
+        # cleanup (a stray unused var, a redundant f-string prefix) never costs a fix
+        # round. Behaviour-affecting fixes are excluded; see autofix_with_ruff().
+        fixed, applied = autofix_with_ruff(code)
+        if applied and fixed != code:
+            res["reply"] = replace_first_code_block(res.get("reply", ""), fixed)
+            code = fixed
         passed, report, checks = smoke_test(code)
         # also surface any non-fatal analysis notes (minor findings) for visibility
         minor = [note for name, ok, note in checks if name == "analysis" and ok and note
@@ -1346,6 +1495,7 @@ def chat_with_autotest(messages, provider_id=None):
                        "checks": [c[0] for c in checks if c[1]],
                        "failed": [c[0] for c in checks if not c[1]],
                        "report": "" if passed else report,
+                       "autofixed": applied,
                        "minor": minor})
         if passed or attempt == AUTOTEST_MAX_ROUNDS:
             res["autotest"] = {"ran": True, "passed": passed, "rounds": rounds}
@@ -2126,7 +2276,7 @@ def main():
     url = f"http://{HOST}:{port}"
     srv = ThreadingHTTPServer((HOST, port), Handler)
     print(f"\n  pysmith v{__version__}  \u2014  {url}")
-    print(f"  building: graphical tools for Kali (KDE + Phosh)")
+    print("  building: graphical tools for Kali (KDE + Phosh)")
     have = [PROVIDERS[pid]["label"] for pid in PROVIDERS if STATE["keys"].get(pid)]
     if have:
         print(f"  keys loaded for: {', '.join(have)}")
@@ -2138,16 +2288,16 @@ def main():
                     fetch_models(pid, force=True)
         threading.Thread(target=_warm, daemon=True).start()
     else:
-        print(f"  no API keys yet \u2014 add one in Settings")
+        print("  no API keys yet \u2014 add one in Settings")
     print(f"  active provider: {PROVIDERS[STATE['provider']]['label']}")
     print(f"  auto-test: up to {AUTOTEST_MAX_ROUNDS} silent fix rounds")
-    print(f"  serving local-only. ctrl-c to stop.\n")
+    print("  serving local-only. ctrl-c to stop.\n")
     used = launch_app_window(url)
     if used:
         print(f"  opened in app window via {used}")
     else:
-        print(f"  no Chromium-family browser found \u2014 opened a normal tab\n"
-              f"  (install chromium for the clean app window)")
+        print("  no Chromium-family browser found \u2014 opened a normal tab\n"
+              "  (install chromium for the clean app window)")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
