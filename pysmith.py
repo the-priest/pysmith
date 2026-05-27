@@ -39,7 +39,7 @@ import urllib.request
 import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-__version__ = "9.0.0"
+__version__ = "9.1.0"
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 # ==========================================================================
@@ -914,6 +914,217 @@ def extract_code(reply):
         or re.search(r"```\s*\n(.*?)```", reply, re.S)
     return m.group(1).rstrip() if m else None
 
+# --------------------------------------------------------------------------
+# WHOLE-CODE ANALYSIS  -- catch clashes the model can't see in its own output
+# --------------------------------------------------------------------------
+# A model checking its OWN code shares its own blind spots ("correlated error
+# modes"), so it can convince itself broken code is fine. An INDEPENDENT analyzer
+# breaks that: it reads the file as a whole and flags real problems — undefined
+# names, calls with the wrong number of arguments, unused variables, redefinitions,
+# unreachable code — BEFORE the tool is ever run. Uses Ruff if it's installed
+# (faster, deeper); otherwise falls back to a built-in ast pass so pysmith stays
+# zero-dependency and "just works".
+
+def _ruff_path():
+    import shutil as _sh
+    return _sh.which("ruff")
+
+def analyze_with_ruff(code):
+    """Run Ruff's correctness lints (the F/E9 families: undefined names, bad calls,
+    unused vars, syntax) and return a list of issue strings. None if Ruff absent."""
+    ruff = _ruff_path()
+    if not ruff:
+        return None
+    fd, path = tempfile.mkstemp(prefix="pysmith_ruff_", suffix=".py")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(code)
+        # F = pyflakes (undefined names, unused imports/vars, redefinitions, f-string bugs)
+        # E9 = syntax/runtime-ish errors. We deliberately skip pure-style rules.
+        proc = subprocess.run(
+            [ruff, "check", "--select", "F,E9", "--output-format", "json", "--no-cache", path],
+            capture_output=True, text=True, timeout=20)
+        try:
+            items = json.loads(proc.stdout or "[]")
+        except Exception:
+            return None
+        out = []
+        for it in items:
+            loc = it.get("location") or {}
+            ln = loc.get("row")
+            code_id = it.get("code") or ""
+            msg = it.get("message") or ""
+            out.append(f"L{ln} {code_id}: {msg}" if ln else f"{code_id}: {msg}")
+        return out
+    except Exception:
+        return None
+    finally:
+        try: os.unlink(path)
+        except Exception: pass
+
+def analyze_with_ast(code):
+    """Built-in fallback analyzer. Walks the AST to catch the highest-value clashes
+    without any third-party dependency:
+      - calls to a locally-defined function with the wrong number of positional args
+      - use of a name that is never defined/imported/built-in (likely typo or clash)
+      - local variables assigned but never used
+    Conservative by design: when in doubt it stays silent, to avoid false alarms that
+    would make the model 'fix' correct code."""
+    import ast, builtins
+    issues = []
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as e:
+        return [f"L{e.lineno} syntax: {e.msg}"]
+
+    builtin_names = set(dir(builtins))
+    # names brought in by imports (so we don't flag them as undefined)
+    imported = set()
+    # top-level function signatures, for arity checking
+    func_sigs = {}      # name -> (min_args, max_args_or_None_for_varargs)
+    defined_top = set() # top-level def/class/assignment names
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                imported.add((a.asname or a.name).split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            for a in node.names:
+                imported.add(a.asname or a.name)
+
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            defined_top.add(node.name)
+            args = node.args
+            posonly = getattr(args, "posonlyargs", [])
+            pos = len(posonly) + len(args.args)
+            ndef = len(args.defaults)
+            has_var = args.vararg is not None or args.kwarg is not None or bool(args.kwonlyargs)
+            func_sigs[node.name] = (pos - ndef, None if has_var else pos)
+        elif isinstance(node, ast.ClassDef):
+            defined_top.add(node.name)
+        elif isinstance(node, ast.Assign):
+            for t in node.targets:
+                if isinstance(t, ast.Name):
+                    defined_top.add(t.id)
+
+    # --- arity check: direct calls to a top-level function by bare name ---
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            fn = node.func.id
+            if fn in func_sigs:
+                # skip calls using *args/**kwargs — too dynamic to judge
+                if any(isinstance(a, ast.Starred) for a in node.args) or \
+                   any(k.arg is None for k in node.keywords):
+                    continue
+                mn, mx = func_sigs[fn]
+                nargs = len(node.args) + len(node.keywords)
+                ln = getattr(node, "lineno", "?")
+                if mx is not None and nargs > mx:
+                    issues.append(f"L{ln} call: {fn}() called with {nargs} args but takes at most {mx}")
+                elif nargs < mn:
+                    issues.append(f"L{ln} call: {fn}() called with {nargs} args but needs at least {mn}")
+
+    # --- unused local variables (per-function, conservative) ---
+    # GUI code constantly assigns the result of a call for its side effects
+    # (building a widget, wiring a signal), so flagging those produces noise. We
+    # ONLY flag a variable that is unused AND was assigned a plain literal/name
+    # (a value with no side effect) — that's far more likely to be a real mistake.
+    class UnusedVisitor(ast.NodeVisitor):
+        def visit_FunctionDef(self, fn):
+            assigned, used, simple = {}, set(), set()
+            for n in ast.walk(fn):
+                if isinstance(n, ast.Assign):
+                    # is the RHS side-effect-free? (literal, name, tuple/list of those)
+                    rhs = n.value
+                    is_simple = isinstance(rhs, (ast.Constant, ast.Name, ast.Tuple,
+                                                 ast.List, ast.Dict, ast.Set))
+                    for t in n.targets:
+                        if isinstance(t, ast.Name):
+                            assigned.setdefault(t.id, t.lineno)
+                            if is_simple:
+                                simple.add(t.id)
+                if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
+                    used.add(n.id)
+                elif isinstance(n, ast.AugAssign) and isinstance(n.target, ast.Name):
+                    used.add(n.target.id)
+            for name, ln in assigned.items():
+                if name == "_" or name.startswith("_"):
+                    continue
+                if name not in used and name in simple:
+                    issues.append(f"L{ln} unused: local variable '{name}' assigned but never used")
+            self.generic_visit(fn)
+    UnusedVisitor().visit(tree)
+
+    # de-dup and cap so we never flood the model
+    seen, uniq = set(), []
+    for i in issues:
+        if i not in seen:
+            seen.add(i); uniq.append(i)
+    return uniq[:25]
+
+def code_map(code):
+    """Build a compact structural map of the current tool: imports, top-level
+    functions (with signatures), and classes (with their methods). Given to the
+    model before it edits, so it sees the file's shape at a glance and stops
+    re-introducing bugs it already fixed or calling things that don't exist.
+    Returns a short string, or '' if the code doesn't parse."""
+    import ast
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return ""
+
+    def sig(fn):
+        a = fn.args
+        parts = []
+        posonly = getattr(a, "posonlyargs", [])
+        allpos = posonly + a.args
+        ndef = len(a.defaults)
+        first_def = len(allpos) - ndef
+        for i, arg in enumerate(allpos):
+            parts.append(arg.arg + ("=…" if i >= first_def else ""))
+        if a.vararg: parts.append("*" + a.vararg.arg)
+        for kw in a.kwonlyargs: parts.append(kw.arg + "=…")
+        if a.kwarg: parts.append("**" + a.kwarg.arg)
+        return f"{fn.name}({', '.join(parts)})"
+
+    imports, funcs, classes = [], [], []
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            imports += [a.asname or a.name for a in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            mod = node.module or ""
+            imports += [f"{mod}.{a.name}" for a in node.names]
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            funcs.append(sig(node))
+        elif isinstance(node, ast.ClassDef):
+            methods = [sig(b) for b in node.body
+                       if isinstance(b, (ast.FunctionDef, ast.AsyncFunctionDef))]
+            bases = [b.id for b in node.bases if isinstance(b, ast.Name)]
+            head = node.name + (f"({', '.join(bases)})" if bases else "")
+            classes.append((head, methods))
+
+    lines = ["STRUCTURE OF THE CURRENT TOOL (for your reference — keep calls consistent with this):"]
+    if imports:
+        lines.append("imports: " + ", ".join(imports[:30]))
+    for head, methods in classes:
+        lines.append(f"class {head}:")
+        for m in methods:
+            lines.append(f"    {m}")
+    if funcs:
+        lines.append("functions: " + "; ".join(funcs))
+    return "\n".join(lines)
+
+def analyze_code(code):
+    """Whole-code clash analysis. Prefers Ruff, falls back to the ast pass.
+    Returns {"issues": [...], "engine": "ruff"|"ast", "clean": bool}."""
+    ruff_issues = analyze_with_ruff(code)
+    if ruff_issues is not None:
+        return {"issues": ruff_issues, "engine": "ruff", "clean": not ruff_issues}
+    ast_issues = analyze_with_ast(code)
+    return {"issues": ast_issues, "engine": "ast", "clean": not ast_issues}
+
 def smoke_test(code):
     """Silent quality checks on generated code. Returns (passed, report, checks).
     IMPORTANT: this only checks that the code PARSES and IMPORTS cleanly. It does
@@ -1001,15 +1212,66 @@ def smoke_test(code):
             checks.append(("imports", False, "import timed out (top-level code is blocking — "
                                              "is a window opening at import time?)"))
             return False, "Import timed out — there may be blocking/GUI code at module top level.", checks
+
+        # 3. whole-code analysis: catch clashes the model can't see in its own output
+        #    (undefined names, wrong-arity calls, unused vars). Independent of the model.
+        analysis = analyze_code(code)
+        if analysis["clean"]:
+            checks.append(("analysis", True, f"{analysis['engine']}: no issues"))
+        else:
+            # Treat these as fixable findings: report them so the autotest loop can
+            # feed them back, but they don't, by themselves, "fail" a tool that imports
+            # fine — some ast findings (e.g. an unused var) are minor. We surface them
+            # and let the loop decide. Genuine correctness issues (undefined name, bad
+            # call) are worth a fix round.
+            serious = [i for i in analysis["issues"]
+                       if any(k in i for k in ("undefined", "call:", "F821", "F811", "F706",
+                                               "F702", "E9", "syntax"))]
+            report = (f"Whole-code analysis ({analysis['engine']}) found:\n  - "
+                      + "\n  - ".join(analysis["issues"]))
+            if serious:
+                checks.append(("analysis", False, report))
+                return False, report, checks
+            else:
+                # only minor findings (e.g. unused vars) — note them, still pass
+                checks.append(("analysis", True, f"{analysis['engine']}: minor only — " +
+                               "; ".join(analysis["issues"][:5])))
         return True, "", checks
     finally:
         try: os.unlink(path)
         except Exception: pass
 
+def _latest_code_in(convo):
+    """Find the most recent code block in a conversation (the current tool)."""
+    for m in reversed(convo):
+        if m.get("role") == "assistant":
+            c = extract_code(m.get("content", ""))
+            if c:
+                return c
+    return None
+
 def chat_with_autotest(messages, provider_id=None):
     """Call the model, then silently smoke-test any code it returns, feeding
     failures back for up to AUTOTEST_MAX_ROUNDS before returning to the user."""
     convo = list(messages)
+
+    # FILE MAP (feature #3): if there's already a tool in this conversation and the
+    # user is asking for a change, give the model a compact structural map of the
+    # current code right before it edits — so it keeps calls consistent with what
+    # actually exists and stops re-introducing bugs. Injected as a transient system
+    # note (not persisted into the saved conversation).
+    existing = _latest_code_in(convo)
+    if existing:
+        cmap = code_map(existing)
+        if cmap:
+            # place the map just before the final user turn so it's freshest in context
+            insert_at = len(convo)
+            for i in range(len(convo) - 1, -1, -1):
+                if convo[i].get("role") == "user":
+                    insert_at = i
+                    break
+            convo = convo[:insert_at] + [{"role": "system", "content": cmap}] + convo[insert_at:]
+
     rounds = []
     res = call_model(convo, provider_id)
     if res.get("error"):

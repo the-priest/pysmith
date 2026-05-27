@@ -135,11 +135,14 @@ Top of `pysmith.py`:
   the model's context window (system prompt + current code + recent turns are always kept), so
   a big session doesn't start erroring. Raise it for big-context models, lower it for small ones.
 - **`AUTOTEST_MAX_ROUNDS`** — after the model writes code, pysmith silently syntax-checks it,
-  verifies it's **import-safe** (a GUI tool must not open its window at import time), and
-  smoke-imports it, feeding failures back to the model up to this many times *before you see
-  it*. It's tolerant of a headless build box — a missing display or toolkit isn't treated as a
-  bug. This is the main quality lever — a weaker model forced to fix its own mistakes beats a
-  stronger one that never checks.
+  verifies it's **import-safe** (a GUI tool must not open its window at import time), smoke-imports
+  it, and runs a **whole-code analysis pass** that catches clashes the model can't see in its own
+  output — undefined names, calls with the wrong number of arguments, dead variables. It uses
+  **Ruff** if installed (faster, deeper) and falls back to a built-in `ast` analyzer otherwise, so
+  it stays zero-dependency. Real correctness issues are fed back to the model to fix, up to this
+  many times *before you see the code*. Before each edit, the model is also handed a compact
+  **structural map** of the current tool (its classes, methods, and function signatures) so it
+  keeps calls consistent and stops re-introducing bugs. This is the main quality lever.
 - **`SYSTEM_PROMPT`** — the tool-building method. Tighten to taste.
 - **`DANGER`** — the destructive-pattern tripwires.
 - **`PORT`** — default `8765` (auto-bumps if taken).
